@@ -10,32 +10,8 @@ const CONFIG = {
 
 const BASE_HTTP_ORIGIN = window.location.origin;
 
-// Set this once via browser console on Render site:
-// localStorage.setItem("hive_pi_base_url","https://administrator-expressions-cross-terry.trycloudflare.com")
-const PI_BASE_URL = (localStorage.getItem("hive_pi_base_url") || "").trim();
-
-// Backward-compat: if you previously used hive_pi_host (like "192.168.100.94:8080")
-const LEGACY_PI_HOST = (localStorage.getItem("hive_pi_host") || "").trim();
-
-const HTTP_ORIGIN = (() => {
-    if (PI_BASE_URL) return PI_BASE_URL; // preferred (supports https)
-    if (LEGACY_PI_HOST) return `http://${LEGACY_PI_HOST}`; // legacy
-    return BASE_HTTP_ORIGIN; // fallback (local dev when serving UI from Pi)
-})();
-
-const WS_ORIGIN = (() => {
-    try {
-        const u = new URL(HTTP_ORIGIN);
-        const proto = u.protocol === "https:" ? "wss:" : "ws:";
-        return `${proto}//${u.host}`;
-    } catch {
-        const proto = window.location.protocol === "https:" ? "wss://" : "ws://";
-        return proto + window.location.host;
-    }
-})();
-
 const PROXY_BASE_URL = (window.BEEROI_CONFIG?.PROXY_BASE_URL || "").trim();
-const HTTP_ORIGIN = PROXY_BASE_URL || window.location.origin;
+const HTTP_ORIGIN = PROXY_BASE_URL || BASE_HTTP_ORIGIN;
 
 const WS_ORIGIN = (() => {
   const u = new URL(HTTP_ORIGIN);
