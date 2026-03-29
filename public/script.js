@@ -23,6 +23,30 @@ const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
 const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
 
+// Audio WS bypass: use current Pi tunnel from proxy /health (more reliable than WS proxy)
+let CURRENT_PI_HTTP_BASE = "";
+
+async function refreshPiBaseFromProxy() {
+  try {
+    const res = await fetch(`${HTTP_ORIGIN}/health`, { cache: "no-store" });
+    if (!res.ok) return;
+    const j = await res.json();
+    if (j?.pi_http_base && typeof j.pi_http_base === "string") {
+      CURRENT_PI_HTTP_BASE = j.pi_http_base.replace(/\/+$/, "");
+    }
+  } catch {}
+}
+
+function getDirectAudioWsUrl() {
+  const base = (CURRENT_PI_HTTP_BASE || "").trim();
+  if (base.startsWith("http")) {
+    const u = new URL(base);
+    const proto = u.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${u.host}/ws/audio`;
+  }
+  // fallback (if /health not ready yet)
+  return RPI_AUDIO_WS_URL;
+}
 const HIVE_TARE_WEIGHT = 2.0;
 
 const AUDIO_STREAM_FORMAT = {
@@ -1125,7 +1149,8 @@ async function toggleAudio() {
     try {
         if (!isListening) {
             await ensureAudioContextRunning();
-            startAudioSocket();
+await refreshPiBaseFromProxy();
+startAudioSocket();
             if (statusLabel) statusLabel.innerText = "Status: Connecting...";
         } else {
             stopAudio();
@@ -1142,7 +1167,7 @@ function startAudioSocket() {
 
     const statusLabel = document.getElementById("audio-level-label");
 
-    audioSocket = new WebSocket(RPI_AUDIO_WS_URL);
+    audioSocket = new WebSocket(getDirectAudioWsUrl());
     audioSocket.binaryType = "arraybuffer";
 
     const connectTimeoutMs = 4000;
@@ -1685,6 +1710,7 @@ function closeSensorModal() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+    refreshPiBaseFromProxy();
     const landingSwarm = document.getElementById("landing-swarm");
     if (landingSwarm) createSwarm(landingSwarm, "landing-bee", 30);
 
