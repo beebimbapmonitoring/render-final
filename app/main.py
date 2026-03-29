@@ -120,7 +120,7 @@ VIDEO_MAX_DETECTIONS = int(os.getenv("VIDEO_MAX_DETECTIONS", "20"))
 # -----------------------------
 AUDIO_ARECORD_DEVICE = os.getenv("AUDIO_ARECORD_DEVICE", "plughw:3,0")
 AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "S16_LE")
-AUDIO_RATE = int(os.getenv("AUDIO_RATE", "48000"))
+AUDIO_RATE = int(os.getenv("AUDIO_RATE", "16000"))
 AUDIO_CHANNELS = int(os.getenv("AUDIO_CHANNELS", "1"))
 AUDIO_CHUNK_MS = int(os.getenv("AUDIO_CHUNK_MS", "40"))
 
