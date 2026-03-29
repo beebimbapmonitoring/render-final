@@ -34,9 +34,19 @@ const WS_ORIGIN = (() => {
     }
 })();
 
+const PROXY_BASE_URL = (window.BEEROI_CONFIG?.PROXY_BASE_URL || "").trim();
+const HTTP_ORIGIN = PROXY_BASE_URL || window.location.origin;
+
+const WS_ORIGIN = (() => {
+  const u = new URL(HTTP_ORIGIN);
+  const proto = u.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${u.host}`;
+})();
+
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
 const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
+
 const HIVE_TARE_WEIGHT = 2.0;
 
 const AUDIO_STREAM_FORMAT = {
