@@ -33,7 +33,7 @@ const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
 const HIVE_TARE_WEIGHT = 2.0;
 
 const AUDIO_STREAM_FORMAT = {
-    sampleRate: 48000,
+    sampleRate: 16000,
     channels: 1,
     bitDepth: 16,
 };
@@ -104,7 +104,7 @@ let WAVE_VIEW_SECONDS = 5.0;
 let WAVE_GAIN = 1.0;
 
 function _ensureAudioRing() {
-    const sr = AUDIO_STREAM_FORMAT.sampleRate || 48000;
+    const sr = AUDIO_STREAM_FORMAT.sampleRate || 16000;
     const capacity = Math.max(1, Math.floor(sr * AUDIO_RING_SECONDS));
     if (!audioRing || audioRing.length !== capacity) {
         audioRing = new Float32Array(capacity);
@@ -1236,7 +1236,7 @@ function playRawAudioBuffer(data) {
     }
 
     // resample to match actual audio device rate (often 44100)
-    const inRate = AUDIO_STREAM_FORMAT.sampleRate;      // 48000 in your config
+    const inRate = AUDIO_STREAM_FORMAT.sampleRate;      // 16000 in your config
     const outRate = ctx.sampleRate;                     // actual playback rate
     const playData = resampleLinear(monoData, inRate, outRate);
 
@@ -1440,7 +1440,7 @@ function animateSpectrogram(canvas) {
         }
     }
 
-    const sr = AUDIO_STREAM_FORMAT.sampleRate || 48000;
+    const sr = AUDIO_STREAM_FORMAT.sampleRate || 16000;
     _ensureAudioRing();
 
     const haveRing = audioRing && (audioRingFilled || audioRingWrite > 0);
