@@ -1,24 +1,35 @@
+# proxy/main.py
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketDisconnect
 
-# Persistent disk mount on Render
-PERSIST_DIR = Path(os.getenv("PERSIST_DIR", "/var/data"))
-TARGET_FILE = PERSIST_DIR / "pi_http_base.txt"
+"""
+Memory-only Render Proxy (Free plan friendly)
+
+- Stores current PI_HTTP_BASE in memory (no persistent disk).
+- Set it via POST /admin/set-pi (secured by ADMIN_TOKEN).
+- Proxies:
+  GET /api/latest
+  GET /video.mjpg
+  WS  /ws/audio
+"""
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 DEFAULT_PI_HTTP_BASE = os.getenv("PI_HTTP_BASE", "").strip().rstrip("/")
 
+# In-memory target (changes via /admin/set-pi)
+PI_HTTP_BASE_RUNTIME = DEFAULT_PI_HTTP_BASE
+
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,26 +38,44 @@ app.add_middleware(
 )
 
 
-def _load_target() -> str:
-    if TARGET_FILE.exists():
-        v = TARGET_FILE.read_text(encoding="utf-8").strip().rstrip("/")
-        if v:
-            return v
-    return DEFAULT_PI_HTTP_BASE.rstrip("/")
+@app.middleware("http")
+async def always_cors(request: Request, call_next):
+    """
+    Ensure CORS headers even on errors (so the browser won't block error visibility).
+    """
+    try:
+        resp = await call_next(request)
+    except Exception as e:
+        resp = JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    origin = request.headers.get("origin", "*")
+    resp.headers["Access-Control-Allow-Origin"] = origin
+    resp.headers["Vary"] = "Origin"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-token"
+    return resp
 
 
-def _save_target(v: str) -> None:
-    PERSIST_DIR.mkdir(parents=True, exist_ok=True)
-    TARGET_FILE.write_text(v.strip().rstrip("/") + "\n", encoding="utf-8")
+@app.options("/{path:path}")
+async def preflight(path: str):
+    return Response(status_code=204)
+
+
+def _validate_url(new_base: str) -> None:
+    u = urlparse(new_base)
+    if not u.scheme or not u.netloc:
+        raise ValueError("Invalid URL")
+    if any(ch.isspace() for ch in u.netloc):
+        raise ValueError("Invalid host (whitespace)")
 
 
 def _pi_http_base() -> str:
-    base = _load_target()
+    base = (PI_HTTP_BASE_RUNTIME or "").strip().rstrip("/")
     if not base:
-        raise RuntimeError("PI_HTTP_BASE not set. Set env PI_HTTP_BASE or call /admin/set-pi.")
+        raise RuntimeError("PI_HTTP_BASE not set. Call /admin/set-pi.")
     if not base.startswith(("http://", "https://")):
         raise RuntimeError("PI_HTTP_BASE must start with http:// or https://")
-    return base.rstrip("/")
+    return base
 
 
 def _pi_ws_base() -> str:
@@ -60,14 +89,15 @@ def _pi_ws_base() -> str:
 async def health() -> dict:
     return {
         "ok": True,
-        "pi_http_base": _load_target() or None,
+        "pi_http_base": PI_HTTP_BASE_RUNTIME or None,
         "has_admin_token": bool(ADMIN_TOKEN),
-        "target_file": str(TARGET_FILE),
     }
 
 
 @app.post("/admin/set-pi")
 async def admin_set_pi(payload: dict, request: Request) -> Response:
+    global PI_HTTP_BASE_RUNTIME
+
     if not ADMIN_TOKEN:
         return Response("ADMIN_TOKEN not configured", status_code=500)
 
@@ -81,25 +111,19 @@ async def admin_set_pi(payload: dict, request: Request) -> Response:
     if not new_base.startswith(("http://", "https://")):
         return Response("pi_http_base must start with http:// or https://", status_code=400)
 
-    u = urlparse(new_base)
-    if not u.scheme or not u.netloc:
-        return Response("Invalid URL", status_code=400)
+    try:
+        _validate_url(new_base)
+    except ValueError as e:
+        return Response(str(e), status_code=400)
 
-    # reject spaces/newlines in host
-    if any(ch.isspace() for ch in u.netloc):
-        return Response("Invalid host (contains whitespace)", status_code=400)
-
-    _save_target(new_base)
-    return Response(
-        content=f'{{"ok":true,"pi_http_base":"{new_base}"}}',
-        media_type="application/json",
-    )
+    PI_HTTP_BASE_RUNTIME = new_base
+    return JSONResponse({"ok": True, "pi_http_base": PI_HTTP_BASE_RUNTIME})
 
 
 @app.get("/api/latest")
 async def api_latest() -> Response:
     url = f"{_pi_http_base()}/api/latest"
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=8) as client:
         r = await client.get(url)
     return Response(
         content=r.content,
@@ -109,7 +133,7 @@ async def api_latest() -> Response:
 
 
 async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
-    timeout = httpx.Timeout(connect=10, read=None, write=10, pool=10)
+    timeout = httpx.Timeout(connect=8, read=None, write=8, pool=8)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("GET", url) as r:
             r.raise_for_status()
@@ -134,7 +158,12 @@ async def ws_audio(ws: WebSocket) -> None:
 
     async with httpx.AsyncClient(timeout=None) as client:
         try:
-            async with client.ws_connect(upstream_url) as up:
+            async with client.ws_connect(
+                upstream_url,
+                ping_interval=20,
+                ping_timeout=20,
+                timeout=20,
+            ) as up:
 
                 async def client_to_upstream() -> None:
                     try:
