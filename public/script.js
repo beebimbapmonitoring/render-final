@@ -9,44 +9,27 @@ const CONFIG = {
 };
 
 const BASE_HTTP_ORIGIN = window.location.origin;
+const BASE_WS_ORIGIN =
+    (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host;
 
-const PROXY_BASE_URL = (window.BEEROI_CONFIG?.PROXY_BASE_URL || "").trim();
-const HTTP_ORIGIN = PROXY_BASE_URL || BASE_HTTP_ORIGIN;
+const FORCE_PI_HOST = localStorage.getItem("hive_pi_host");
+const isLocal = ["localhost", "10.120.24.146"].includes(window.location.hostname);
 
-const WS_ORIGIN = (() => {
-  const u = new URL(HTTP_ORIGIN);
-  const proto = u.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${u.host}`;
-})();
+if (isLocal && FORCE_PI_HOST && window.location.host !== FORCE_PI_HOST) {
+    const target = `http://${FORCE_PI_HOST}${window.location.pathname}${window.location.search}${window.location.hash}`;
+    window.location.replace(target);
+}
+
+const HTTP_ORIGIN = isLocal && FORCE_PI_HOST ? `http://${FORCE_PI_HOST}` : BASE_HTTP_ORIGIN;
+const WS_ORIGIN =
+    isLocal && FORCE_PI_HOST
+        ? `${window.location.protocol === "https:" ? "wss://" : "ws://"}${FORCE_PI_HOST}`
+        : BASE_WS_ORIGIN;
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
 const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
 
-// Audio WS bypass: use current Pi tunnel from proxy /health (more reliable than WS proxy)
-let CURRENT_PI_HTTP_BASE = "";
-
-async function refreshPiBaseFromProxy() {
-  try {
-    const res = await fetch(`${HTTP_ORIGIN}/health`, { cache: "no-store" });
-    if (!res.ok) return;
-    const j = await res.json();
-    if (j?.pi_http_base && typeof j.pi_http_base === "string") {
-      CURRENT_PI_HTTP_BASE = j.pi_http_base.replace(/\/+$/, "");
-    }
-  } catch {}
-}
-
-function getDirectAudioWsUrl() {
-  const base = (CURRENT_PI_HTTP_BASE || "").trim();
-  if (base.startsWith("http")) {
-    const u = new URL(base);
-    const proto = u.protocol === "https:" ? "wss:" : "ws:";
-    return `${proto}//${u.host}/ws/audio`;
-  }
-  // fallback (if /health not ready yet)
-  return RPI_AUDIO_WS_URL;
-}
 const HIVE_TARE_WEIGHT = 2.0;
 
 const AUDIO_STREAM_FORMAT = {
@@ -499,11 +482,11 @@ function maybeTriggerAIAlert(audioClass, cameraClass, colonyState = "", audioAle
 function ensureAudioContext() {
     if (!audioContext) {
         const Ctx = window.AudioContext || window.webkitAudioContext;
-        audioContext = new Ctx({ sampleRate: AUDIO_STREAM_FORMAT.sampleRate });
+        audioContext = new Ctx(); // <-- remove forced sampleRate
         audioMasterGain = audioContext.createGain();
-        audioMasterGain.gain.value = 1.0;
+        audioMasterGain.gain.value = 2.5; // volume boost (ok)
         audioMasterGain.connect(audioContext.destination);
-        audioNextPlayTime = audioContext.currentTime + 0.1;
+        audioNextPlayTime = audioContext.currentTime + 0.05; // smaller lead
     }
     return audioContext;
 }
@@ -512,6 +495,22 @@ async function ensureAudioContextRunning() {
     const ctx = ensureAudioContext();
     if (ctx.state === "suspended") await ctx.resume();
     return ctx;
+}
+
+function resampleLinear(input, inRate, outRate) {
+    if (inRate === outRate) return input;
+    const ratio = outRate / inRate;
+    const outLen = Math.max(1, Math.floor(input.length * ratio));
+    const output = new Float32Array(outLen);
+
+    for (let i = 0; i < outLen; i++) {
+        const srcIndex = i / ratio;
+        const i0 = Math.floor(srcIndex);
+        const i1 = Math.min(i0 + 1, input.length - 1);
+        const frac = srcIndex - i0;
+        output[i] = input[i0] * (1 - frac) + input[i1] * frac;
+    }
+    return output;
 }
 
 function initChart() {
@@ -1149,8 +1148,7 @@ async function toggleAudio() {
     try {
         if (!isListening) {
             await ensureAudioContextRunning();
-await refreshPiBaseFromProxy();
-startAudioSocket();
+            startAudioSocket();
             if (statusLabel) statusLabel.innerText = "Status: Connecting...";
         } else {
             stopAudio();
@@ -1167,7 +1165,7 @@ function startAudioSocket() {
 
     const statusLabel = document.getElementById("audio-level-label");
 
-    audioSocket = new WebSocket(getDirectAudioWsUrl());
+    audioSocket = new WebSocket(RPI_AUDIO_WS_URL);
     audioSocket.binaryType = "arraybuffer";
 
     const connectTimeoutMs = 4000;
@@ -1237,27 +1235,36 @@ function playRawAudioBuffer(data) {
         if (abs > peak) peak = abs;
     }
 
-    audioWaveData = monoData;
-    _pushToAudioRing(monoData);
+    // resample to match actual audio device rate (often 44100)
+    const inRate = AUDIO_STREAM_FORMAT.sampleRate;      // 48000 in your config
+    const outRate = ctx.sampleRate;                     // actual playback rate
+    const playData = resampleLinear(monoData, inRate, outRate);
 
-    const buffer = ctx.createBuffer(1, monoData.length, AUDIO_STREAM_FORMAT.sampleRate);
-    buffer.getChannelData(0).set(monoData);
+    audioWaveData = playData;
+    _pushToAudioRing(playData);
+
+    const buffer = ctx.createBuffer(1, playData.length, outRate);
+    buffer.getChannelData(0).set(playData);
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(audioMasterGain);
 
-    const safeLead = 0.12;
-    if (audioNextPlayTime < ctx.currentTime + safeLead) audioNextPlayTime = ctx.currentTime + safeLead;
+    const safeLead = 0.05;          // lower latency than 0.12
+    const maxLagSeconds = 0.18;     // drop backlog sooner (lower delay)
+
+    if (audioNextPlayTime < ctx.currentTime + safeLead) {
+        audioNextPlayTime = ctx.currentTime + safeLead;
+    }
+    if (audioNextPlayTime - ctx.currentTime > maxLagSeconds) {
+        audioNextPlayTime = ctx.currentTime + safeLead; // resync
+    }
 
     source.start(audioNextPlayTime);
     audioNextPlayTime += buffer.duration;
 
     const statusLabel = document.getElementById("audio-level-label");
     if (statusLabel) statusLabel.innerText = `Status: Live • Level ${(peak * 100).toFixed(0)}%`;
-
-    if (peak > 0.12) updateAudioCardStatus("Active", "#2ecc71");
-    else updateAudioCardStatus(prettyAudioClass(latestAudioClass), getAudioColor(latestAudioClass));
 }
 
 function stopAudio() {
@@ -1710,7 +1717,6 @@ function closeSensorModal() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-    refreshPiBaseFromProxy();
     const landingSwarm = document.getElementById("landing-swarm");
     if (landingSwarm) createSwarm(landingSwarm, "landing-bee", 30);
 
