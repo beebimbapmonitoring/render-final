@@ -8,28 +8,14 @@ const CONFIG = {
     weight: 14.5,
 };
 
-// ~/hive-server/public/script.js
-
-const BASE_HTTP_ORIGIN = window.location.origin;
-const BASE_WS_ORIGIN =
-  (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host;
-
-/**
- * If your dashboard is hosted on Render and your sensors/live feeds are on a Pi
- * exposed via Tailscale Funnel, set this to your Funnel URL:
- *   localStorage.setItem("hive_funnel_origin", "https://YOUR-PI.ts.net")
- *
- * Or define in HTML:
- *   window.__HIVE_FUNNEL_ORIGIN = "https://YOUR-PI.ts.net"
- */
 const FUNNEL_ORIGIN =
   (window.__HIVE_FUNNEL_ORIGIN && String(window.__HIVE_FUNNEL_ORIGIN).trim()) ||
   (localStorage.getItem("hive_funnel_origin") || "").trim();
 
-const HTTP_ORIGIN = FUNNEL_ORIGIN || BASE_HTTP_ORIGIN;
+const HTTP_ORIGIN = FUNNEL_ORIGIN || window.location.origin;
 const WS_ORIGIN = FUNNEL_ORIGIN
   ? FUNNEL_ORIGIN.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://")
-  : BASE_WS_ORIGIN;
+  : ((window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host);
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
