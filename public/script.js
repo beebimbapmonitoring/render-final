@@ -121,7 +121,7 @@ let WAVE_VIEW_SECONDS = 5.0;
 let WAVE_GAIN = 1.0;
 
 function _ensureAudioRing() {
-    const sr = AUDIO_STREAM_FORMAT.sampleRate || 16000;
+    const sr = AUDIO_STREAM_FORMAT.sampleRate || 48000;
     const capacity = Math.max(1, Math.floor(sr * AUDIO_RING_SECONDS));
     if (!audioRing || audioRing.length !== capacity) {
         audioRing = new Float32Array(capacity);
@@ -1433,7 +1433,7 @@ function animateSpectrogram(canvas) {
         }
     }
 
-    const sr = AUDIO_STREAM_FORMAT.sampleRate || 16000;
+    const sr = AUDIO_STREAM_FORMAT.sampleRate || 48000;
     _ensureAudioRing();
 
     const haveRing = audioRing && (audioRingFilled || audioRingWrite > 0);
