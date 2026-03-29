@@ -9,27 +9,34 @@ const CONFIG = {
 };
 
 const BASE_HTTP_ORIGIN = window.location.origin;
-const BASE_WS_ORIGIN =
-    (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host;
 
-const FORCE_PI_HOST = localStorage.getItem("hive_pi_host");
-const isLocal = ["localhost", "10.120.24.146"].includes(window.location.hostname);
+// Set this once via browser console on Render site:
+// localStorage.setItem("hive_pi_base_url","https://administrator-expressions-cross-terry.trycloudflare.com")
+const PI_BASE_URL = (localStorage.getItem("hive_pi_base_url") || "").trim();
 
-if (isLocal && FORCE_PI_HOST && window.location.host !== FORCE_PI_HOST) {
-    const target = `http://${FORCE_PI_HOST}${window.location.pathname}${window.location.search}${window.location.hash}`;
-    window.location.replace(target);
-}
+// Backward-compat: if you previously used hive_pi_host (like "192.168.100.94:8080")
+const LEGACY_PI_HOST = (localStorage.getItem("hive_pi_host") || "").trim();
 
-const HTTP_ORIGIN = isLocal && FORCE_PI_HOST ? `http://${FORCE_PI_HOST}` : BASE_HTTP_ORIGIN;
-const WS_ORIGIN =
-    isLocal && FORCE_PI_HOST
-        ? `${window.location.protocol === "https:" ? "wss://" : "ws://"}${FORCE_PI_HOST}`
-        : BASE_WS_ORIGIN;
+const HTTP_ORIGIN = (() => {
+    if (PI_BASE_URL) return PI_BASE_URL; // preferred (supports https)
+    if (LEGACY_PI_HOST) return `http://${LEGACY_PI_HOST}`; // legacy
+    return BASE_HTTP_ORIGIN; // fallback (local dev when serving UI from Pi)
+})();
+
+const WS_ORIGIN = (() => {
+    try {
+        const u = new URL(HTTP_ORIGIN);
+        const proto = u.protocol === "https:" ? "wss:" : "ws:";
+        return `${proto}//${u.host}`;
+    } catch {
+        const proto = window.location.protocol === "https:" ? "wss://" : "ws://";
+        return proto + window.location.host;
+    }
+})();
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
 const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
-
 const HIVE_TARE_WEIGHT = 2.0;
 
 const AUDIO_STREAM_FORMAT = {
