@@ -8,13 +8,16 @@ const CONFIG = {
     weight: 14.5,
 };
 
+const CONFIG_BASE =
+  (window.BEEROI_CONFIG && String(window.BEEROI_CONFIG.PROXY_BASE_URL || "").trim()) || "";
+
 const FUNNEL_ORIGIN =
   (window.__HIVE_FUNNEL_ORIGIN && String(window.__HIVE_FUNNEL_ORIGIN).trim()) ||
   (localStorage.getItem("hive_funnel_origin") || "").trim();
 
-const HTTP_ORIGIN = FUNNEL_ORIGIN || window.location.origin;
-const WS_ORIGIN = FUNNEL_ORIGIN
-  ? FUNNEL_ORIGIN.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://")
+const HTTP_ORIGIN = CONFIG_BASE || FUNNEL_ORIGIN || window.location.origin;
+const WS_ORIGIN = (CONFIG_BASE || FUNNEL_ORIGIN)
+  ? (CONFIG_BASE || FUNNEL_ORIGIN).replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://")
   : ((window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host);
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
