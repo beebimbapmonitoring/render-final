@@ -50,7 +50,7 @@ function getDirectAudioWsUrl() {
 const HIVE_TARE_WEIGHT = 2.0;
 
 const AUDIO_STREAM_FORMAT = {
-    sampleRate: 16000,
+    sampleRate: 48000,
     channels: 1,
     bitDepth: 16,
 };
