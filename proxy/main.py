@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request, Response, WebSocket
@@ -74,9 +75,19 @@ async def admin_set_pi(payload: dict, request: Request) -> Response:
     if token != ADMIN_TOKEN:
         return Response("Unauthorized", status_code=401)
 
-    new_base = str(payload.get("pi_http_base", "")).strip().rstrip("/")
+    raw = str(payload.get("pi_http_base", "")).strip()
+    new_base = raw.rstrip("/")
+
     if not new_base.startswith(("http://", "https://")):
         return Response("pi_http_base must start with http:// or https://", status_code=400)
+
+    u = urlparse(new_base)
+    if not u.scheme or not u.netloc:
+        return Response("Invalid URL", status_code=400)
+
+    # reject spaces/newlines in host
+    if any(ch.isspace() for ch in u.netloc):
+        return Response("Invalid host (contains whitespace)", status_code=400)
 
     _save_target(new_base)
     return Response(
