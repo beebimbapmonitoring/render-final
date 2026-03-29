@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>BEEROI</title>
+
+    <link rel="stylesheet" href="style.css">
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+
+    <link
+        href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;800;900&family=Poppins:wght@300;400;600;800&family=Roboto+Mono:wght@400;700&display=swap"
+        rel="stylesheet">
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+
+    <div id="landing-view" class="landing-container">
+        <div class="landing-bg-layer">
+            <div class="honey-glow"></div>
+            <div id="landing-swarm"></div>
+        </div>
+
+        <nav class="public-nav glass-panel">
+            <div class="brand-logo zesty-text">
+                <i class="fas fa-archive bounce-icon"></i>BEEROI
+            </div>
+
+            <div class="nav-links desktop-only">
+                <button onclick="switchPublicTab('hero')" class="zesty-btn small-zesty secondary">Home</button>
+                <button onclick="switchPublicTab('bees')" class="zesty-btn small-zesty secondary">Stingless
+                    Bees</button>
+                <button onclick="switchPublicTab('capstone')" class="zesty-btn small-zesty secondary">Research
+                    Paper</button>
+            </div>
+
+            <div style="display: flex; gap: 10px; align-items: center;">
+                <button class="zesty-btn small-zesty" onclick="goToLogin()">Admin Portal</button>
+                <button class="mobile-menu-btn" onclick="toggleMobileMenu()">
+                    <i class="fas fa-bars"></i>
+                </button>
+            </div>
+        </nav>
+
+        <div id="mobile-public-menu" class="mobile-menu-dropdown hidden glass-panel">
+            <button onclick="mobileNavClick('hero')"><i class="fas fa-home"></i> Home</button>
+            <button onclick="mobileNavClick('bees')"><i class="fas fa-bug"></i> Stingless Bees</button>
+            <button onclick="mobileNavClick('capstone')"><i class="fas fa-book"></i> Research Paper</button>
+        </div>
+
+        <header id="hero" class="hero-section public-section">
+            <div class="hero-content">
+                <div class="hero-text">
+                    <h1>Preserving the <span class="zesty-text">Tetragonula biroi</span></h1>
+                    <p>
+                        An advanced IoT &amp; Machine Learning monitoring system designed to protect native
+                        stingless bee colonies through non-invasive acoustic and visual analysis.
+                    </p>
+                    <button class="zesty-btn" onclick="switchPublicTab('bees')">
+                        Learn More About Stingless Bees
+                        <i class="fas fa-arrow-right" style="margin-left: 8px;"></i>
+                    </button>
+                </div>
+
+                <div class="hero-image">
+                    <div id="bee-tracker" class="bee-wrapper">
+                        <div class="giant-floating-bee">🐝</div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <section id="bees" class="info-section public-section hidden">
+            <h2 class="section-title zesty-text">The Native Stingless Bee</h2>
+            <p class="section-intro">
+                <em>Tetragonula biroi</em>, locally known as "Kiyot" or "Lukot", is a species of stingless bee native to
+                the Philippines.
+                Unlike honeybees, they do not sting but defend their colonies by biting and using resin. They are vital
+                pollinators
+                for mangoes, coconuts, and dipterocarp forests.
+            </p>
+
+            <div class="info-grid">
+                <div class="info-card">
+                    <div class="card-icon"><i class="fas fa-leaf"></i></div>
+                    <h3>Forest Pollinators</h3>
+                    <p>
+                        They are generalist pollinators, visiting a wide variety of flowering plants.
+                        Their small size allows them to enter flowers that larger bees cannot access.
+                    </p>
+                    <button onclick="openLinksModal('pollinators')" class="text-link-btn">
+                        View Resources <i class="fas fa-list-ul"></i>
+                    </button>
+                </div>
+
+                <div class="info-card">
+                    <div class="card-icon"><i class="fas fa-flask"></i></div>
+                    <h3>Medicinal Pot Honey</h3>
+                    <p>
+                        Stored in pots made of beeswax and resin, their honey is more liquid and acidic than Apis honey,
+                        known for high antioxidant and antimicrobial properties.
+                    </p>
+                    <button onclick="openLinksModal('honey')" class="text-link-btn">
+                        View Resources <i class="fas fa-list-ul"></i>
+                    </button>
+                </div>
+
+                <div class="info-card">
+                    <div class="card-icon"><i class="fas fa-shield-alt"></i></div>
+                    <h3>Propolis Defense</h3>
+                    <p>
+                        Lacking a sting, they construct intricate entrance tubes and seal intruders in sticky resin
+                        (Propolis)
+                        to neutralize threats to the colony.
+                    </p>
+                    <button onclick="openLinksModal('defense')" class="text-link-btn">
+                        View Resources <i class="fas fa-list-ul"></i>
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <section id="capstone" class="project-section public-section hidden">
+            <div class="project-card">
+                <div class="project-content">
+                    <span class="tag">Capstone Project 2025-2026</span>
+                    <h2 class="zesty-text">
+                        Audio-Video Analysis for Colony Activity and Intrusion Alert for
+                        <em>Tetragonula biroi</em> Utilizing Machine-Based Learning
+                    </h2>
+
+                    <div class="abstract-box">
+                        <strong>Abstract:</strong><br><br>
+                        This study developed an audio-video monitoring system utilizing
+                        machine-based learning to analyze colony activity and detect intrusions in
+                        Tetragonula biroi (stingless bee) hives. The system integrates sensors and
+                        embedded devices, including an ESP32-S3 microcontroller, Raspberry Pi 4
+                        Model B, temperature and humidity sensor, microphone, load cell, and
+                        Raspberry Pi Camera Module 3, to collect environmental, acoustic, and
+                        visual data from the hive. The collected data are processed to monitor hive
+                        conditions and identify abnormal activities or potential predator intrusions
+                        in real time.Testing was conducted through laboratory evaluation and field
+                        deployment using an active T. biroi hive.<br><br>
+
+                        Results showed reliable
+                        environmental monitoring, stable sensor performance, and consistent data
+                        transmission. The machine learning-based intrusion detection system
+                        achieved high detection reliability, with accuracy reaching up to 85% and
+                        real-time alert notifications delivered within approximately 3–4 seconds. A
+                        web-based dashboard was also implemented to allow users to monitor
+                        hive conditions and receive alerts across multiple devices.<br><br>
+
+                        The system
+                        demonstrated fast response times, reliable alert delivery, and stable
+                        operation during field testing. Overall, the proposed system provides a
+                        non-invasive and automated monitoring solution that can help beekeepers
+                        detect hive disturbances early and improve colony management.<br><br>
+
+                        <strong>Keywords:</strong> Stingless bee (<em>Tetragonula biroi</em>), machine learning,
+                        audio-video analysis,
+                        hive monitoring, intrusion detection, precision apiculture
+                    </div>
+
+                    <div class="project-text">
+                        <h4>System Capabilities</h4>
+                        <p>
+                            BEEROI integrates an ESP32-S3 and Raspberry Pi 4B to process multi-modal data from SHT30-B
+                            environmental sensors, HX711 weight telemetry, and INMP441 microphones. It utilizes YOLOv8
+                            and CNN architectures for real-time predator detection and acoustic classification,
+                            delivering automated alerts to a web-based dashboard via a hybrid MQTT and Socket.IO
+                            framework.
+                        </p>
+                    </div>
+
+                    <div class="project-actions">
+                        <a href="assets/Final Paper.pdf" download="BEEROI_Capstone_Paper.pdf" class="zesty-btn"
+                            style="text-decoration: none; color: white;">
+                            <i class="fas fa-file-pdf"></i> Download Full Paper (PDF)
+                            <a href="https://drive.google.com/file/d/1VnH0WnAljAqIzvO6RBLlzZ0YIX3SOpG9/view?usp=sharing"
+                                target="_blank" class="zesty-btn secondary"
+                                style="text-decoration: none; display: inline-block;">
+                                <i class="fas fa-book-open"></i> Read Full Paper Online
+                            </a>
+
+                            <div class="collaboration-footer">
+                                <p class="collab-text">In special collaboration with Hardin sa Parang</p>
+                                <p class="uni-text">Quezon City University • BS Electronics Engineering</p>
+                                <p class="uni-text">Academic Year 2025 - 2026</p>
+                                <div style="margin-top: 20px; font-size: 13px; color: #999;">
+                                    <strong>Proponents:</strong><br>
+                                    Aguinido, M.P. • Barela, D.J.L. • Espiritu, G.T.C. • Gironella, J.C.C. • Obumani,
+                                    M.D.B. •
+                                    Rabonza, S.D.P.
+                                </div>
+                            </div>
+                    </div>
+                </div>
+        </section>
+
+        <footer style="text-align: center; padding: 20px; color: #999; font-size: 12px;">
+            <p>© 2026 BEEROI Project. All Rights Reserved.</p>
+        </footer>
+    </div>
+
+    <div id="links-modal" class="modal-overlay hidden">
+        <div class="modal-content links-modal-content">
+            <button class="close-modal" onclick="closeLinksModal()"><i class="fas fa-times"></i></button>
+            <div class="links-header">
+                <h2 id="links-modal-title">Resources</h2>
+            </div>
+            <div class="resource-list" id="links-list-container"></div>
+        </div>
+    </div>
+
+    <div id="login-view" class="login-container hidden">
+        <button class="back-home-btn" onclick="backToHome()"><i class="fas fa-arrow-left"></i> Back</button>
+        <div class="login-card">
+            <div class="floating-bee">🐝</div>
+            <h2>BEEROI Login</h2>
+            <p style="margin-bottom: 20px; color: #636e72;">Secure System Access</p>
+
+            <div class="input-group">
+                <i class="fas fa-envelope"></i>
+                <input type="email" id="email-input" placeholder="keeper@gmail.com">
+            </div>
+
+            <div class="input-group">
+                <i class="fas fa-lock"></i>
+                <input type="password" id="password-input" placeholder="Password (hive123)">
+            </div>
+
+            <p id="login-error" class="error-msg hidden" style="color: #fa5252; font-size: 12px;">Access Denied</p>
+            <button class="zesty-btn login-btn" onclick="attemptLogin()">AUTHENTICATE</button>
+        </div>
+    </div>
+
+    <div id="dashboard-view" class="dashboard-container hidden">
+        <div class="organic-bg">
+            <div class="floating-pot p1"></div>
+            <div class="floating-pot p2"></div>
+            <div id="dashboard-swarm"></div>
+        </div>
+
+        <nav class="sidebar glass-panel">
+            <div class="brand">
+                <i class="fas fa-archive" style="color: var(--accent);"></i>BEEROI
+            </div>
+
+            <div class="user-profile clickable-profile" onclick="switchTab('profile')">
+                <div class="user-avatar">
+                    <img id="sidebar-avatar" src="https://api.dicebear.com/7.x/avataaars/svg?seed=Felix" alt="User">
+                </div>
+                <div class="user-info">
+                    <span id="sidebar-name">Admin</span>
+                    <small id="sidebar-role">Head Keeper</small>
+                </div>
+            </div>
+
+            <ul class="nav-menu">
+                <li class="active nav-item-dashboard" onclick="switchTab('dashboard')"><i class="fas fa-chart-line"></i>
+                    Dashboard</li>
+                <li class="nav-item-logs" onclick="switchTab('logs')"><i class="fas fa-clipboard-list"></i> Activity
+                    Logs</li>
+                <li class="nav-item-settings" onclick="switchTab('settings')"><i class="fas fa-sliders-h"></i> System
+                    Settings</li>
+            </ul>
+
+            <ul class="nav-bottom">
+                <li onclick="logout()" class="logout-btn"><i class="fas fa-sign-out-alt"></i> Logout</li>
+            </ul>
+        </nav>
+
+        <main class="main-content">
+            <header>
+                <div class="greeting-box">
+                    <h1 id="greeting-text">Hello! 👋</h1>
+                    <p class="subtitle" id="location-display">Authorized Personnel</p>
+                </div>
+
+                <div class="header-actions">
+                    <button class="action-btn refresh-btn-global" onclick="manualRefresh()">
+                        <i class="fas fa-sync-alt"></i>
+                    </button>
+
+                    <div class="desktop-actions">
+                        <button class="zesty-btn small-zesty" onclick="exportData()">Export CSV</button>
+                    </div>
+
+                    <button class="mobile-menu-btn dashboard-menu-btn" onclick="toggleDashboardMenu()">
+                        <i class="fas fa-ellipsis-v"></i>
+                    </button>
+                </div>
+            </header>
+
+            <div id="dashboard-mobile-dropdown" class="mobile-menu-dropdown hidden glass-panel"
+                style="top: 75px; right: 20px; z-index: 2000;">
+                <button onclick="exportData()"><i class="fas fa-file-download"></i> Save CSV</button>
+                <button onclick="logout()" style="color: #ff4757;"><i class="fas fa-sign-out-alt"></i> Logout</button>
+            </div>
+
+            <section id="view-dashboard" class="view-section">
+                <div class="cards-grid">
+                    <div class="stat-card card-temp clickable-card" onclick="openDetailedGraphOnCardClick('temp')">
+                        <div class="icon-box"><i class="fas fa-temperature-high"></i></div>
+                        <div class="stat-info">
+                            <h3>Brood Temp</h3>
+                            <p id="temp-display">--</p>
+                            <span class="badge">Target: 30°C</span>
+                        </div>
+                    </div>
+
+                    <div class="stat-card card-hum clickable-card" onclick="openDetailedGraphOnCardClick('humidity')">
+                        <div class="icon-box"><i class="fas fa-tint"></i></div>
+                        <div class="stat-info">
+                            <h3>Humidity</h3>
+                            <p id="hum-display">--</p>
+                            <span class="badge">Range: 60-70%</span>
+                        </div>
+                    </div>
+
+                    <div class="stat-card card-weight clickable-card" onclick="openDetailedGraphOnCardClick('weight')">
+                        <div class="icon-box"><i class="fas fa-weight-hanging"></i></div>
+                        <div class="stat-info">
+                            <h3>Hive Weight</h3>
+                            <p id="weight-display">--</p>
+                            <span class="badge">Growth: +2%</span>
+                        </div>
+                    </div>
+
+                    <div class="stat-card card-audio clickable-card" onclick="openAudioModal()">
+                        <div class="icon-box"><i class="fas fa-microphone-alt"></i></div>
+                        <div class="stat-info">
+                            <h3>Acoustics</h3>
+                            <p id="audio-display">Normal</p>
+                            <span class="badge" id="audio-badge">Listening</span>
+                        </div>
+                    </div>
+
+                    <div class="stat-card card-cam clickable-card" onclick="openVideoModal()">
+                        <div class="icon-box"><i class="fas fa-video"></i></div>
+                        <div class="stat-info">
+                            <h3>Entrance</h3>
+                            <p class="status-text">Active</p>
+                            <span class="badge blink-red" id="cam-badge">● Live</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="status-summary-grid">
+                    <div class="mini-status-card">
+                        <div class="mini-status-header">
+                            <span><i class="fas fa-brain"></i> Colony State</span>
+                            <span class="mini-pill" id="colony-state-pill">normal_activity</span>
+                        </div>
+                        <div class="mini-status-body">
+                            <strong id="colony-state-display">Normal Activity</strong>
+                            <small id="analysis-time-display">Waiting for analysis...</small>
+                        </div>
+                    </div>
+
+                    <div class="mini-status-card">
+                        <div class="mini-status-header">
+                            <span><i class="fas fa-wave-square"></i> Audio AI</span>
+                            <span class="mini-pill" id="audio-alert-pill">No Alert</span>
+                        </div>
+                        <div class="mini-status-body">
+                            <strong id="audio-ai-top">normal • 0%</strong>
+                            <small id="audio-ai-note">Always-on acoustic monitoring active</small>
+                        </div>
+                    </div>
+
+                    <div class="mini-status-card">
+                        <div class="mini-status-header">
+                            <span><i class="fas fa-crosshairs"></i> Video AI</span>
+                            <span class="mini-pill" id="video-alert-pill">Watching</span>
+                        </div>
+                        <div class="mini-status-body">
+                            <strong id="video-ai-top">unknown • 0%</strong>
+                            <small id="video-ai-note">Entrance object detection standby</small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="chart-wrapper">
+                    <div class="chart-header">
+                        <h3>Microclimate Trends</h3>
+                        <div class="live-indicator" style="font-size: 12px; color: var(--text-muted);">
+                            <span class="blink"></span> Real-time
+                        </div>
+                    </div>
+                    <div class="canvas-container">
+                        <canvas id="hiveChart"></canvas>
+                    </div>
+                </div>
+            </section>
+
+            <section id="view-logs" class="view-section hidden">
+                <div class="pro-card scrollable-card">
+                    <h3>System Activity Log</h3>
+                    <div class="table-responsive">
+                        <table id="logs-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Event Description</th>
+                                    <th>T/H/W Sensors</th>
+                                    <th>ML Conf.</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <section id="view-profile" class="view-section hidden">
+                <div class="pro-card">
+                    <div class="pro-header">
+                        <h3><i class="fas fa-id-card-alt" style="color: var(--accent);"></i> Keeper Profile</h3>
+                        <span class="badge-id">ID: 8821-ECE</span>
+                    </div>
+
+                    <div class="profile-layout">
+                        <div class="avatar-section">
+                            <img id="avatar-preview" src="https://api.dicebear.com/7.x/avataaars/svg?seed=Felix"
+                                class="avatar-preview" alt="Avatar">
+                            <div class="upload-btn-wrapper">
+                                <button class="btn-upload" onclick="document.getElementById('avatar-upload').click()">
+                                    <i class="fas fa-camera"></i> Change Photo
+                                </button>
+                                <input type="file" id="avatar-upload" accept="image/*" style="display:none;"
+                                    onchange="previewImage(this)">
+                            </div>
+                        </div>
+
+                        <div class="form-section">
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label>First Name</label>
+                                    <input type="text" id="edit-name" class="pro-input" placeholder="e.g. Glenda">
+                                </div>
+
+                                <div class="form-group">
+                                    <label>Role / Title</label>
+                                    <input type="text" id="edit-role" class="pro-input"
+                                        placeholder="e.g. Senior Researcher">
+                                </div>
+
+                                <div class="form-group">
+                                    <label>License / Credentials</label>
+                                    <input type="text" id="edit-credentials" class="pro-input"
+                                        placeholder="e.g. LIC-2025-ECE">
+                                </div>
+
+                                <div class="form-group">
+                                    <label>Contact Email</label>
+                                    <input type="text" value="admin@beeroi.org" class="pro-input" disabled
+                                        style="opacity: 0.7;">
+                                </div>
+                            </div>
+
+                            <button class="full-width-btn" onclick="saveProfile()">SAVE CHANGES</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="view-settings" class="view-section hidden">
+                <div class="pro-card">
+                    <div class="pro-header">
+                        <h3><i class="fas fa-sliders-h" style="color: var(--accent);"></i> Dashboard Configuration</h3>
+                    </div>
+
+                    <div class="settings-grid">
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <h4>Data Refresh Rate</h4>
+                                <p>Frequency of sensor data updates from ESP32</p>
+                            </div>
+                            <div class="setting-control">
+                                <select id="setting-refresh" onchange="saveSettings()">
+                                    <option value="1000">Fast (1s)</option>
+                                    <option value="2000" selected>Normal (2s)</option>
+                                    <option value="5000">Slow (5s)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <h4>Alert Sensitivity</h4>
+                                <p>Threshold for triggering intrusion alerts</p>
+                            </div>
+                            <div class="setting-control" style="display: flex; align-items: center; gap: 10px;">
+                                <span style="font-size: 10px;">Low</span>
+                                <input type="range" id="setting-sensitivity" min="1" max="10" value="8"
+                                    class="range-slider" onchange="saveSettings()">
+                                <span style="font-size: 10px;">High</span>
+                            </div>
+                        </div>
+
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <h4>Audio Notifications</h4>
+                                <p>Play sound when alert is triggered</p>
+                            </div>
+                            <div class="setting-control">
+                                <label class="switch">
+                                    <input type="checkbox" id="setting-audio" checked onchange="saveSettings()">
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 30px; text-align: center;">
+                        <button class="btn-upload" onclick="resetSettings()">Reset to Default</button>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <nav class="mobile-nav hidden" id="mobile-nav-bar">
+        <div class="nav-item-dashboard active" onclick="switchTab('dashboard')"><i class="fas fa-chart-pie"></i></div>
+        <div class="nav-item-logs" onclick="switchTab('logs')"><i class="fas fa-list-ul"></i></div>
+        <div class="nav-item-profile" onclick="switchTab('profile')">
+            <img id="nav-mini-avatar" src="https://api.dicebear.com/7.x/avataaars/svg?seed=Felix" class="nav-mini-img"
+                alt="Mini avatar">
+        </div>
+        <div class="nav-item-settings" onclick="switchTab('settings')"><i class="fas fa-sliders-h"></i></div>
+    </nav>
+
+    <div id="video-modal" class="modal-overlay hidden">
+        <div class="modal-content video-modal-content">
+            <button class="close-modal" onclick="closeVideoModal()"><i class="fas fa-times"></i></button>
+
+            <div class="video-layout">
+                <div class="video-player">
+                    <div class="cam-overlay">
+                        <span class="cam-rec blink-red">● LIVE STREAM</span>
+                        <span id="cam-time">00:00:00</span>
+                    </div>
+
+                    <img id="cctv-feed" src="" alt="Waiting for connection...">
+                </div>
+
+                <div class="video-logs">
+                    <div class="logs-header">
+                        <h3>Detected Events</h3>
+                        <button type="button" onclick="deleteVideoLogs()" class="delete-logs-btn">Clear</button>
+                    </div>
+
+                    <div class="ai-side-panel">
+                        <div class="ai-panel-block">
+                            <div class="ai-panel-title">Top Detection</div>
+                            <div id="video-top-detection" class="ai-panel-big">No detection</div>
+                            <div id="video-top-meta" class="ai-panel-small">Confidence: --</div>
+                        </div>
+
+                        <div class="ai-panel-block">
+                            <div class="ai-panel-title">Detected Objects</div>
+                            <div id="video-detection-list" class="detection-list">
+                                <div class="empty-detection">Waiting for detections...</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="log-list" id="video-events-list">
+                        <div class="log-item active" onclick="playVideo(this, 'LIVE FEED')">
+                            <span>Live</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="sensor-modal" class="modal-overlay hidden">
+        <div class="modal-content sensor-modal-content">
+            <button class="close-modal" onclick="closeSensorModal()"><i class="fas fa-times"></i></button>
+            <div class="sensor-details">
+                <div class="sensor-icon-large" id="modal-sensor-icon"></div>
+                <h2 id="modal-sensor-title"></h2>
+                <h1 id="modal-sensor-value"></h1>
+                <p id="modal-sensor-desc"></p>
+                <div class="sensor-stats-grid">
+                    <div class="sensor-stat-item">
+                        <span>Status</span>
+                        <strong style="color: #2ecc71">Normal</strong>
+                    </div>
+                    <div class="sensor-stat-item">
+                        <span>Updated</span>
+                        <strong id="modal-sensor-time">Now</strong>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="detailed-graph-modal" class="modal-overlay hidden">
+        <div class="detailed-modal-content">
+            <button class="close-modal" onclick="closeDetailedGraphModal()"><i class="fas fa-times"></i></button>
+            <div class="detailed-graph-container">
+                <h2 id="detailed-graph-title"></h2>
+                <div class="canvas-container-detailed">
+                    <canvas id="detailedChart"></canvas>
+                </div>
+                <div class="graph-stats">
+                    <div class="stat-box"><span>Current</span><strong id="graph-current">--</strong></div>
+                    <div class="stat-box"><span>Max</span><strong id="graph-max">--</strong></div>
+                    <div class="stat-box"><span>Min</span><strong id="graph-min">--</strong></div>
+                    <div class="stat-box"><span>Avg</span><strong id="graph-avg">--</strong></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="audio-modal" class="modal-overlay hidden">
+        <div class="modal-content audio-modal-content">
+            <button class="close-modal" onclick="closeAudioModal()"><i class="fas fa-times"></i></button>
+
+            <div class="audio-layout">
+                <div class="spectrogram-section">
+                    <h3>Audio Visualizer</h3>
+                    <div class="spectrogram-display" id="spectrogram-display">
+                        <canvas id="spectrogramCanvas"></canvas>
+                    </div>
+
+                    <div class="audio-zoom-toolbar">
+                        <label>
+                            Zoom X
+                            <input type="range" id="audio-zoom-x" min="0.5" max="4" step="0.1" value="1">
+                        </label>
+                        <label>
+                            Zoom Y
+                            <input type="range" id="audio-zoom-y" min="0.5" max="4" step="0.1" value="1.25">
+                        </label>
+                    </div>
+
+                    <div class="audio-ai-summary">
+                        <div class="audio-ai-box">
+                            <div class="audio-ai-label">Top Audio Class</div>
+                            <div id="audio-modal-top-class" class="audio-ai-value">normal</div>
+                            <div id="audio-modal-top-conf" class="audio-ai-sub">Confidence: 0%</div>
+                        </div>
+
+                        <div class="audio-ai-box">
+                            <div class="audio-ai-label">Alert Mode</div>
+                            <div id="audio-modal-alert-mode" class="audio-ai-value">No Alert</div>
+                            <div id="audio-modal-colony-note" class="audio-ai-sub">Colony state: normal_activity</div>
+                        </div>
+                    </div>
+
+                    <div class="audio-score-board">
+                        <div class="logs-header">
+                            <h3>Audio Class Scores</h3>
+                        </div>
+                        <div id="audio-score-list" class="score-list">
+                            <div class="empty-detection">Waiting for audio classification...</div>
+                        </div>
+                    </div>
+
+                    <div class="audio-controls"
+                        style="display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 15px;">
+                        <button onclick="toggleAudio()" class="zesty-btn small-zesty"
+                            style="background-color: #ff4757; color: white;">
+                            <i id="audio-icon" class="fas fa-volume-mute"></i>
+                            <span id="audio-btn-text">LISTEN LIVE</span>
+                        </button>
+
+                        <span id="audio-level-label">Status: Ready</span>
+                        <audio id="live-audio-player" src="" crossorigin="anonymous" style="display:none;"></audio>
+                    </div>
+                </div>
+
+                <div class="audio-logs-section">
+                    <div class="logs-header">
+                        <h3>Events</h3>
+                        <button type="button" onclick="deleteAudioLogs()" class="delete-logs-btn">Clear</button>
+                    </div>
+                    <div class="audio-events-list" id="audio-events-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="alert-notification" class="alert-notification hidden">
+        <i class="fas fa-bell"></i>
+        <span id="alert-message">Acoustic Alert</span>
+    </div>
+
+    <div id="alert-modal" class="alert-modal-overlay hidden">
+        <div class="alert-modal-content">
+            <div class="alert-header">
+                <i class="fas fa-exclamation-circle alert-icon"></i>
+                <h2 id="alert-modal-title">🚨 INTRUSION DETECTED!</h2>
+            </div>
+            <div class="alert-body">
+                <p id="alert-modal-message">Abnormal buzzing pattern detected at the hive entrance</p>
+                <div class="alert-timestamp" id="alert-timestamp">Timestamp: 00:00:00</div>
+            </div>
+            <div class="alert-actions">
+                <button onclick="closeAlertModal()" class="alert-close-btn">✓ Acknowledge</button>
+                <button onclick="viewAudioLogs()" class="alert-view-btn">📊 View Details</button>
+                <button onclick="resetAlertState()" class="alert-reset-btn">↺ Reset Alert</button>
+            </div>
+        </div>
+    </div>
+
+    <audio id="alert-sound" preload="auto"></audio>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
