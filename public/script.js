@@ -26,7 +26,9 @@ function _buildHttpAndWsUrls(httpOrigin) {
 
   return {
     RPI_URL: new URL("/api/latest", httpBase).toString(),
-    RPI_AUDIO_WS_URL: new URL("/ws/audio", wsBase).toString(),
+    // Force WSS if on Render
+    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    RPI_AUDIO_WS_URL = `${wsProtocol}//beeroi-web.onrender.com/ws/audio`;
     RPI_VIDEO_URL: new URL("/video.mjpg", httpBase).toString(),
   };
 }
