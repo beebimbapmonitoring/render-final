@@ -264,19 +264,21 @@ async def _connect_upstream_ws(url: str, headers: list[tuple[str, str]] | None):
 
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket) -> None:
+    # 1. Tanggapin ang connection mula sa Browser
     await ws.accept()
 
     try:
         upstream_url = f"{_pi_ws_base()}/ws/audio"
     except Exception as e:
-        print("[PROXY WS] missing PI_HTTP_BASE:", repr(e))
         await ws.close(code=1011, reason="PI_HTTP_BASE not set")
         return
 
-    print("[PROXY WS] client connected; upstream:", upstream_url)
+    print(f"[PROXY WS] Attempting upstream connect to: {upstream_url}")
 
     try:
+        # 2. Dagdagan ang timeout at i-disable ang compression para sa bilis
         async with await _connect_upstream_ws(upstream_url, _upstream_headers_ws()) as up:
+            print("[PROXY WS] Connection to RPi SUCCESS")
 
             async def client_to_upstream() -> None:
                 try:
@@ -284,12 +286,18 @@ async def ws_audio(ws: WebSocket) -> None:
                         msg = await ws.receive()
                         if msg.get("type") == "websocket.disconnect":
                             break
+                        
+                        # KEEP-ALIVE: Kung nakatanggap ng ping, sumagot ng pong
+                        # at ipasa rin sa upstream.
+                        if msg.get("text") == "ping":
+                            await ws.send_text("pong")
+                            await up.send("ping")
+                            continue
+
                         if msg.get("text") is not None:
                             await up.send(msg["text"])
                         elif msg.get("bytes") is not None:
                             await up.send(msg["bytes"])
-                except WebSocketDisconnect:
-                    pass
                 except Exception:
                     pass
 
@@ -306,15 +314,18 @@ async def ws_audio(ws: WebSocket) -> None:
 
             t1 = asyncio.create_task(client_to_upstream())
             t2 = asyncio.create_task(upstream_to_client())
-            _, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+            
+            # Hintayin ang kahit alin sa dalawa na matapos
+            done, pending = await asyncio.wait(
+                {t1, t2}, return_when=asyncio.FIRST_COMPLETED
+            )
             for p in pending:
                 p.cancel()
 
-    except WebSocketDisconnect:
-        return
     except Exception as e:
-        print("[PROXY WS] upstream connect/relay failed:", repr(e))
+        # DITO NATIN MAKIKITA KUNG BAKIT AYAW
+        print(f"[PROXY WS] CONNECTION TO RPI FAILED: {repr(e)}")
         try:
-            await ws.close(code=1011, reason="upstream ws failed")
+            await ws.close(code=1011, reason=f"RPi Unreachable: {str(e)[:50]}")
         except Exception:
             pass
