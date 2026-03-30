@@ -1,4 +1,4 @@
-# proxy/main.py
+# /proxy/main.py
 from __future__ import annotations
 
 import os
@@ -17,15 +17,21 @@ Memory-only Render Proxy (Free plan friendly)
 - Stores current PI_HTTP_BASE in memory (no persistent disk).
 - Set it via POST /admin/set-pi (secured by ADMIN_TOKEN).
 - Proxies:
-  GET /api/latest
-  GET /video.mjpg
-  WS  /ws/audio
+  GET /api/latest        -> Pi /api/latest (should include sensors)
+  GET /api/sensors       -> Pi /api/sensors (optional)
+  GET /video.mjpg        -> Pi /video.mjpg
+  WS  /ws/audio          -> Pi /ws/audio
+  WS  /ws/sensors        -> Pi /ws/sensors (optional)
+
+Security:
+- If PI_API_TOKEN is set, proxy adds: Authorization: Bearer <token> to Pi requests.
+- Put PI_HTTP_BASE = https://jonard.tail630aa1.ts.net in Render env for Funnel.
 """
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 DEFAULT_PI_HTTP_BASE = os.getenv("PI_HTTP_BASE", "").strip().rstrip("/")
+PI_API_TOKEN = os.getenv("PI_API_TOKEN", "").strip()
 
-# In-memory target (changes via /admin/set-pi)
 PI_HTTP_BASE_RUNTIME = DEFAULT_PI_HTTP_BASE
 
 app = FastAPI()
@@ -41,7 +47,7 @@ app.add_middleware(
 @app.middleware("http")
 async def always_cors(request: Request, call_next):
     """
-    Ensure CORS headers even on errors (so the browser won't block error visibility).
+    Keeps CORS headers even when errors happen, so browser can read error responses.
     """
     try:
         resp = await call_next(request)
@@ -52,7 +58,7 @@ async def always_cors(request: Request, call_next):
     resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-token"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-token, Authorization"
     return resp
 
 
@@ -85,12 +91,19 @@ def _pi_ws_base() -> str:
     return "ws://" + base.removeprefix("http://")
 
 
+def _auth_headers() -> dict[str, str]:
+    if not PI_API_TOKEN:
+        return {}
+    return {"Authorization": f"Bearer {PI_API_TOKEN}"}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {
         "ok": True,
         "pi_http_base": PI_HTTP_BASE_RUNTIME or None,
         "has_admin_token": bool(ADMIN_TOKEN),
+        "has_pi_api_token": bool(PI_API_TOKEN),
     }
 
 
@@ -120,11 +133,10 @@ async def admin_set_pi(payload: dict, request: Request) -> Response:
     return JSONResponse({"ok": True, "pi_http_base": PI_HTTP_BASE_RUNTIME})
 
 
-@app.get("/api/latest")
-async def api_latest() -> Response:
-    url = f"{_pi_http_base()}/api/latest"
-    async with httpx.AsyncClient(timeout=8) as client:
-        r = await client.get(url)
+async def _forward_get(path: str, timeout_s: float = 8.0) -> Response:
+    url = f"{_pi_http_base()}/{path.lstrip('/')}"
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        r = await client.get(url, headers=_auth_headers())
     return Response(
         content=r.content,
         status_code=r.status_code,
@@ -132,10 +144,22 @@ async def api_latest() -> Response:
     )
 
 
+@app.get("/api/latest")
+async def api_latest() -> Response:
+    # RPi should include sensors in this payload for simplest frontend
+    return await _forward_get("/api/latest")
+
+
+@app.get("/api/sensors")
+async def api_sensors() -> Response:
+    # Optional: if you implement Pi /api/sensors
+    return await _forward_get("/api/sensors")
+
+
 async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
     timeout = httpx.Timeout(connect=8, read=None, write=8, pool=8)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("GET", url) as r:
+        async with client.stream("GET", url, headers=_auth_headers()) as r:
             r.raise_for_status()
             async for chunk in r.aiter_bytes():
                 if chunk:
@@ -151,15 +175,16 @@ async def video_mjpg() -> StreamingResponse:
     )
 
 
-@app.websocket("/ws/audio")
-async def ws_audio(ws: WebSocket) -> None:
+async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
     await ws.accept()
-    upstream_url = f"{_pi_ws_base()}/ws/audio"
+    upstream_url = f"{_pi_ws_base()}/{upstream_path.lstrip('/')}"
+    headers = _auth_headers()
 
     async with httpx.AsyncClient(timeout=None) as client:
         try:
             async with client.ws_connect(
                 upstream_url,
+                headers=headers,
                 ping_interval=20,
                 ping_timeout=20,
                 timeout=20,
@@ -206,3 +231,14 @@ async def ws_audio(ws: WebSocket) -> None:
                 await ws.close()
             except Exception:
                 pass
+
+
+@app.websocket("/ws/audio")
+async def ws_audio(ws: WebSocket) -> None:
+    await _ws_passthrough(ws, "/ws/audio")
+
+
+@app.websocket("/ws/sensors")
+async def ws_sensors(ws: WebSocket) -> None:
+    # Optional: if you implement Pi /ws/sensors
+    await _ws_passthrough(ws, "/ws/sensors")
