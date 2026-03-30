@@ -93,6 +93,33 @@ async def health() -> dict:
     }
 
 
+@app.get("/debug/upstream")
+async def debug_upstream() -> dict:
+    """
+    Quick Render-side test to verify that the Pi HTTP endpoint is reachable.
+    """
+    base = _pi_http_base()
+    url = f"{base}/api/latest"
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            r = await client.get(url, headers=_auth_headers())
+        return {
+            "ok": True,
+            "url": url,
+            "status_code": r.status_code,
+            "content_type": r.headers.get("content-type", ""),
+            "preview": r.text[:300],
+        }
+    except Exception as e:
+        logger.exception("Upstream HTTP debug failed")
+        return {
+            "ok": False,
+            "url": url,
+            "error_type": type(e).__name__,
+            "error": str(e),
+        }
+
+
 @app.post("/admin/set-pi")
 async def admin_set_pi(payload: dict, request: Request) -> Response:
     global PI_HTTP_BASE_RUNTIME
@@ -120,10 +147,13 @@ async def admin_set_pi(payload: dict, request: Request) -> Response:
     return JSONResponse({"ok": True, "pi_http_base": PI_HTTP_BASE_RUNTIME})
 
 
-async def _forward_get(path: str, timeout_s: float = 8.0) -> Response:
+async def _forward_get(path: str, timeout_s: float = 12.0) -> Response:
     url = f"{_pi_http_base()}/{path.lstrip('/')}"
+    logger.info("Forwarding GET to %s", url)
+
     async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
         r = await client.get(url, headers=_auth_headers())
+
     return Response(
         content=r.content,
         status_code=r.status_code,
@@ -142,7 +172,9 @@ async def api_sensors() -> Response:
 
 
 async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
-    timeout = httpx.Timeout(connect=8, read=None, write=8, pool=8)
+    timeout = httpx.Timeout(connect=12, read=None, write=12, pool=12)
+    logger.info("Streaming upstream from %s", url)
+
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         async with client.stream("GET", url, headers=_auth_headers()) as r:
             r.raise_for_status()
@@ -177,6 +209,23 @@ async def _safe_close_ws(ws: WebSocket, code: int = 1011, reason: str = "") -> N
         pass
 
 
+def _websocket_connect_kwargs(headers: dict[str, str]) -> dict:
+    """
+    Compatibility helper for different websockets versions.
+    Some versions use extra_headers, others use additional_headers.
+    """
+    kwargs = {
+        "ping_interval": 20,
+        "ping_timeout": 20,
+        "open_timeout": 20,
+        "close_timeout": 10,
+        "max_size": None,
+    }
+    if headers:
+        kwargs["extra_headers"] = headers
+    return kwargs
+
+
 async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
     upstream_url = _build_upstream_ws_url(ws, upstream_path)
     headers = _auth_headers()
@@ -184,15 +233,9 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
     logger.info("Connecting upstream websocket: %s", upstream_url)
 
     try:
-        async with websockets.connect(
-            upstream_url,
-            additional_headers=headers if headers else None,
-            ping_interval=20,
-            ping_timeout=20,
-            open_timeout=20,
-            close_timeout=10,
-            max_size=None,
-        ) as upstream:
+        connect_kwargs = _websocket_connect_kwargs(headers)
+
+        async with websockets.connect(upstream_url, **connect_kwargs) as upstream:
             await ws.accept()
             logger.info("WebSocket relay established: client <-> %s", upstream_url)
 
@@ -200,9 +243,11 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
                 try:
                     while True:
                         msg = await ws.receive()
+
                         if msg["type"] == "websocket.disconnect":
                             logger.info("Client disconnected")
                             break
+
                         if msg.get("text") is not None:
                             await upstream.send(msg["text"])
                         elif msg.get("bytes") is not None:
@@ -246,6 +291,11 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
                 except Exception:
                     logger.exception("Relay task failed")
 
+    except TypeError as e:
+        logger.exception("websockets.connect argument mismatch")
+        await ws.accept()
+        await ws.send_text(f"WS proxy config error: {type(e).__name__}: {e}")
+        await _safe_close_ws(ws, code=1011, reason="WS proxy config error")
     except Exception as e:
         logger.exception("Failed to establish upstream websocket")
         await _safe_close_ws(ws, code=1011, reason=f"Upstream connection failed: {type(e).__name__}")
