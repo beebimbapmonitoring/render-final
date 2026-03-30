@@ -1,4 +1,3 @@
-# app/main.py
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +13,7 @@ from typing import Optional, List, Dict, Any, Tuple
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,29 +35,6 @@ except Exception:
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PUBLIC_DIR = BASE_DIR / "public"
-
-# -----------------------------
-# Security (recommended with Funnel)
-# -----------------------------
-PI_API_TOKEN = os.getenv("PI_API_TOKEN", "").strip()
-
-
-def require_bearer(authorization: str | None) -> None:
-    """
-    If PI_API_TOKEN is set, require:
-      Authorization: Bearer <PI_API_TOKEN>
-    """
-    if not PI_API_TOKEN:
-        return
-    if authorization != f"Bearer {PI_API_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def ws_require_bearer(ws: WebSocket) -> bool:
-    if not PI_API_TOKEN:
-        return True
-    return ws.headers.get("authorization") == f"Bearer {PI_API_TOKEN}"
-
 
 # -----------------------------
 # Model paths
@@ -119,7 +95,7 @@ ALERT_STATE: Dict[str, Any] = {
     "triggered_at": 0.0,
     "acknowledged": False,
     "acknowledged_at": 0.0,
-    "latched": False,
+    "latched": False,   # once acknowledged, do not re-trigger until reset
 }
 
 MANUAL_VIDEO_VIEW: Dict[str, Any] = {
@@ -177,21 +153,6 @@ WORKING_AUDIO_DEVICE: Optional[str] = None
 audio_ws_clients: set[WebSocket] = set()
 audio_broadcast_lock = asyncio.Lock()
 
-# -----------------------------
-# Env sensor payload
-# -----------------------------
-class EnvPayload(BaseModel):
-    temperature: float
-    humidity: float
-    weight: float
-
-
-LATEST_ENV: Dict[str, Any] = {
-    "temp_c": None,
-    "hum_pct": None,
-    "weight_kg": None,
-    "ts": None,
-}
 
 # -----------------------------
 # Alert / manual helpers
@@ -206,6 +167,7 @@ def sync_alert_status_to_ai() -> None:
 
 
 def activate_alert(audio_class: str) -> None:
+    # latched means acknowledged already; keep log-only behavior until reset
     if ALERT_STATE["latched"]:
         sync_alert_status_to_ai()
         return
@@ -216,10 +178,12 @@ def activate_alert(audio_class: str) -> None:
     ALERT_STATE["triggered_at"] = time.time()
     ALERT_STATE["acknowledged"] = False
     ALERT_STATE["acknowledged_at"] = 0.0
+
     sync_alert_status_to_ai()
 
 
 def activate_video_alert(camera_class: str) -> None:
+    # same latched behavior for visual alerts
     if ALERT_STATE["latched"]:
         sync_alert_status_to_ai()
         return
@@ -230,14 +194,17 @@ def activate_video_alert(camera_class: str) -> None:
     ALERT_STATE["triggered_at"] = time.time()
     ALERT_STATE["acknowledged"] = False
     ALERT_STATE["acknowledged_at"] = 0.0
+
     sync_alert_status_to_ai()
 
 
 def acknowledge_alert() -> None:
+    # acknowledge = hide/stop retrigger until reset
     ALERT_STATE["active"] = False
     ALERT_STATE["acknowledged"] = True
     ALERT_STATE["acknowledged_at"] = time.time()
     ALERT_STATE["latched"] = True
+
     sync_alert_status_to_ai()
 
 
@@ -249,6 +216,7 @@ def reset_alert_latch() -> None:
     ALERT_STATE["acknowledged"] = False
     ALERT_STATE["acknowledged_at"] = 0.0
     ALERT_STATE["latched"] = False
+
     sync_alert_status_to_ai()
 
 
@@ -257,6 +225,7 @@ def is_camera_needed() -> bool:
 
 
 def is_video_ai_needed() -> bool:
+    # Manual open of card should also open video AI
     return ALERT_STATE["active"] or MANUAL_VIDEO_VIEW["active"]
 
 
@@ -330,6 +299,7 @@ def load_video_model() -> None:
 # Status helpers
 # -----------------------------
 def compute_audio_flags(audio_class: str) -> Dict[str, bool]:
+    # if alert already acknowledged, abnormal classes should become log-only until reset
     if ALERT_STATE["latched"]:
         return {
             "audio_alert": False,
@@ -343,6 +313,7 @@ def compute_audio_flags(audio_class: str) -> Dict[str, bool]:
 
 
 def compute_video_flags(camera_class: str) -> Dict[str, bool]:
+    # if alert already acknowledged, visual alerts also become log-only until reset
     if ALERT_STATE["latched"]:
         return {
             "camera_alert": False,
@@ -624,9 +595,14 @@ def _parse_yolo_output(
     dwdh: Tuple[float, float],
 ) -> Dict[str, Any]:
     if not outputs:
-        return {"camera_class": "no_detection", "camera_conf": 0.0, "camera_detections": []}
+        return {
+            "camera_class": "no_detection",
+            "camera_conf": 0.0,
+            "camera_detections": [],
+        }
 
     pred = np.squeeze(outputs[0])
+
     if pred.ndim != 2:
         pred = pred.reshape(pred.shape[0], -1) if pred.ndim > 2 else pred.reshape(1, -1)
 
@@ -639,7 +615,11 @@ def _parse_yolo_output(
     elif pred.T.shape[1] == 4 + num_classes:
         pred = pred.T
     else:
-        return {"camera_class": "video_output_unrecognized", "camera_conf": 0.0, "camera_detections": []}
+        return {
+            "camera_class": "video_output_unrecognized",
+            "camera_conf": 0.0,
+            "camera_detections": [],
+        }
 
     boxes_xywh = pred[:, :4].astype(np.float32)
     cls_scores = pred[:, 4:4 + num_classes].astype(np.float32)
@@ -649,7 +629,11 @@ def _parse_yolo_output(
 
     mask = confs >= VIDEO_CONF_THRESHOLD
     if not np.any(mask):
-        return {"camera_class": "no_detection", "camera_conf": 0.0, "camera_detections": []}
+        return {
+            "camera_class": "no_detection",
+            "camera_conf": 0.0,
+            "camera_detections": [],
+        }
 
     boxes_xywh = boxes_xywh[mask]
     cls_ids = cls_ids[mask]
@@ -659,6 +643,7 @@ def _parse_yolo_output(
     boxes_xyxy = _scale_boxes_to_original(boxes_xyxy, frame_shape, ratio, dwdh)
 
     final_detections: List[Dict[str, Any]] = []
+
     for cls_id in np.unique(cls_ids):
         idxs = np.where(cls_ids == cls_id)[0]
         class_boxes = boxes_xyxy[idxs]
@@ -672,21 +657,43 @@ def _parse_yolo_output(
             final_detections.append({
                 "class": label,
                 "conf": round(score, 4),
-                "bbox": [round(float(box[0]), 2), round(float(box[1]), 2), round(float(box[2]), 2), round(float(box[3]), 2)],
+                "bbox": [
+                    round(float(box[0]), 2),
+                    round(float(box[1]), 2),
+                    round(float(box[2]), 2),
+                    round(float(box[3]), 2),
+                ],
             })
 
     final_detections.sort(key=lambda x: x["conf"], reverse=True)
     final_detections = final_detections[:VIDEO_MAX_DETECTIONS]
+
     if not final_detections:
-        return {"camera_class": "no_detection", "camera_conf": 0.0, "camera_detections": []}
+        return {
+            "camera_class": "no_detection",
+            "camera_conf": 0.0,
+            "camera_detections": [],
+        }
 
     top = final_detections[0]
-    return {"camera_class": top["class"], "camera_conf": top["conf"], "camera_detections": final_detections}
+    return {
+        "camera_class": top["class"],
+        "camera_conf": top["conf"],
+        "camera_detections": final_detections,
+    }
 
 
 def run_video_inference(frame_bgr: np.ndarray) -> Dict[str, Any]:
-    if video_interpreter is None or video_input_details is None or video_output_details is None:
-        return {"camera_class": "video_model_unavailable", "camera_conf": 0.0, "camera_detections": []}
+    if (
+        video_interpreter is None
+        or video_input_details is None
+        or video_output_details is None
+    ):
+        return {
+            "camera_class": "video_model_unavailable",
+            "camera_conf": 0.0,
+            "camera_detections": [],
+        }
 
     try:
         h, w = frame_bgr.shape[:2]
@@ -704,7 +711,11 @@ def run_video_inference(frame_bgr: np.ndarray) -> Dict[str, Any]:
         return _parse_yolo_output(outputs, (h, w), ratio, dwdh)
     except Exception as e:
         print(f"⚠️ Video inference failed: {e}")
-        return {"camera_class": "video_inference_error", "camera_conf": 0.0, "camera_detections": []}
+        return {
+            "camera_class": "video_inference_error",
+            "camera_conf": 0.0,
+            "camera_detections": [],
+        }
 
 
 # -----------------------------
@@ -1093,33 +1104,38 @@ async def startup_event():
     asyncio.create_task(background_video_analyzer())
 
 
-@app.get("/health")
-async def health():
-    return {
-        "ok": True,
-        "has_pi_api_token": bool(PI_API_TOKEN),
-        "audio_model": str(AUDIO_MODEL_PATH),
-        "video_model": str(VIDEO_MODEL_PATH),
-    }
+class EnvPayload(BaseModel):
+    temperature: float
+    humidity: float
+    weight: float
+
+
+LATEST_ENV = {
+    "temp_c": None,
+    "hum_pct": None,
+    "weight_kg": None,
+    "ts": None,
+}
 
 
 @app.post("/receive-data")
-async def receive_data(payload: EnvPayload, authorization: str | None = Header(default=None)):
-    # Protect ingest (recommended). Keep /api/latest public if you want public dashboard.
-    require_bearer(authorization)
-
+async def receive_data(payload: EnvPayload):
     LATEST_ENV.update({
-        "temp_c": float(payload.temperature),
-        "hum_pct": float(payload.humidity),
-        "weight_kg": float(payload.weight),
+        "temp_c": payload.temperature,
+        "hum_pct": payload.humidity,
+        "weight_kg": payload.weight, # <--- Siguraduhin na may LATEST_ENV.update
         "ts": time.time(),
     })
+    print(f"📥 SUCCESS: Received Weight {payload.weight}kg")
     return {"ok": True}
 
 
 @app.post("/api/alert/ack")
 async def api_ack_alert():
     acknowledge_alert()
+
+    # after acknowledge: stop active visual alert UI/stream trigger,
+    # but keep AI + logs behavior available via latest status
     AI_STATUS["camera_alert"] = False
 
     if not is_camera_needed():
@@ -1162,10 +1178,22 @@ async def api_video_open():
     return {"ok": True, "manual_video_active": True}
 
 
+@app.post("/receive-data")
+async def receive_data(payload: EnvPayload):
+    LATEST_ENV.update({
+        "temp_c": payload.temperature,
+        "hum_pct": payload.humidity,
+        "weight_kg": payload.weight,
+        "ts": time.time(),
+    })
+    return {"ok": True}
+
+
 @app.get("/api/latest")
 async def api_latest():
     sync_alert_status_to_ai()
 
+    # Kunin natin ang values sa LATEST_ENV nang maayos
     temp = LATEST_ENV.get("temp_c")
     hum = LATEST_ENV.get("hum_pct")
     weight = LATEST_ENV.get("weight_kg")
@@ -1175,7 +1203,7 @@ async def api_latest():
         "temp_c": temp if temp is not None else 0.0,
         "hum_pct": hum if hum is not None else 0.0,
         "weight_kg": weight if weight is not None else 0.0,
-        "weight": weight if weight is not None else 0.0,  # backup key for UI
+        "weight": weight if weight is not None else 0.0, # Backup key para sa website
 
         # --- AUDIO AI STATUS ---
         "audio_class": AI_STATUS.get("audio_class", "normal"),
@@ -1215,7 +1243,6 @@ async def api_latest():
         "ts": time.time(),
     })
 
-
 @app.get("/video.mjpg")
 async def video_mjpg():
     if not is_camera_needed():
@@ -1234,27 +1261,18 @@ async def video_mjpg():
 
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket):
-    # FIX 1: Payagan ang connection kahit galing sa ibang domain (CORS for WS)
-    # Ang "*" ay nangangahulugang kahit anong website ay pwedeng kumonekta.
     await ws.accept()
-    
-    print(f"[WS] /ws/audio accepted from {ws.client.host if ws.client else 'unknown'}")
 
     async with audio_broadcast_lock:
         audio_ws_clients.add(ws)
 
     try:
         while True:
-            # FIX 2: Mag-antay ng message galing sa client (Heartbeat)
-            # Imbes na asyncio.sleep(30), mas maganda kung nakikinig ang server
-            # para hindi ito i-terminate ng Render proxy dahil sa inactivity.
-            data = await ws.receive_text()
-            if data == "ping":
-                await ws.send_text("pong")
+            await asyncio.sleep(60)
     except WebSocketDisconnect:
-        print("[WS] /ws/audio disconnected")
-    except Exception as e:
-        print(f"[WS] Error: {e}")
+        pass
+    except Exception:
+        pass
     finally:
         async with audio_broadcast_lock:
             audio_ws_clients.discard(ws)
