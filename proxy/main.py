@@ -1,15 +1,17 @@
-# /proxy/main.py
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from typing import AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
+import websockets
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 """
 Memory-only Render Proxy (Free plan friendly)
@@ -25,8 +27,11 @@ Memory-only Render Proxy (Free plan friendly)
 
 Security:
 - If PI_API_TOKEN is set, proxy adds: Authorization: Bearer <token> to Pi requests.
-- Put PI_HTTP_BASE = https://jonard.tail630aa1.ts.net in Render env for Funnel.
+- Put PI_HTTP_BASE = https://your-pi-public-url in Render env for Funnel/public access.
 """
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("render-proxy")
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 DEFAULT_PI_HTTP_BASE = os.getenv("PI_HTTP_BASE", "").strip().rstrip("/")
@@ -38,7 +43,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten this in production if you know your frontend origin
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -52,6 +57,7 @@ async def always_cors(request: Request, call_next):
     try:
         resp = await call_next(request)
     except Exception as e:
+        logger.exception("Unhandled HTTP proxy error")
         resp = JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
     origin = request.headers.get("origin", "*")
@@ -130,35 +136,36 @@ async def admin_set_pi(payload: dict, request: Request) -> Response:
         return Response(str(e), status_code=400)
 
     PI_HTTP_BASE_RUNTIME = new_base
+    logger.info("Updated PI_HTTP_BASE_RUNTIME to %s", PI_HTTP_BASE_RUNTIME)
     return JSONResponse({"ok": True, "pi_http_base": PI_HTTP_BASE_RUNTIME})
 
 
 async def _forward_get(path: str, timeout_s: float = 8.0) -> Response:
     url = f"{_pi_http_base()}/{path.lstrip('/')}"
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
+    async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
         r = await client.get(url, headers=_auth_headers())
+
+    content_type = r.headers.get("content-type", "application/json")
     return Response(
         content=r.content,
         status_code=r.status_code,
-        media_type=r.headers.get("content-type", "application/json"),
+        media_type=content_type,
     )
 
 
 @app.get("/api/latest")
 async def api_latest() -> Response:
-    # RPi should include sensors in this payload for simplest frontend
     return await _forward_get("/api/latest")
 
 
 @app.get("/api/sensors")
 async def api_sensors() -> Response:
-    # Optional: if you implement Pi /api/sensors
     return await _forward_get("/api/sensors")
 
 
 async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
     timeout = httpx.Timeout(connect=8, read=None, write=8, pool=8)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         async with client.stream("GET", url, headers=_auth_headers()) as r:
             r.raise_for_status()
             async for chunk in r.aiter_bytes():
@@ -175,62 +182,98 @@ async def video_mjpg() -> StreamingResponse:
     )
 
 
+def _build_upstream_ws_url(ws: WebSocket, upstream_path: str) -> str:
+    base = _pi_ws_base()
+    path = upstream_path.lstrip("/")
+    query = ws.url.query
+    url = f"{base}/{path}"
+    if query:
+        url = f"{url}?{query}"
+    return url
+
+
+async def _safe_close_ws(ws: WebSocket, code: int = 1011, reason: str = "") -> None:
+    try:
+        if ws.client_state != WebSocketState.DISCONNECTED:
+            await ws.close(code=code, reason=reason)
+    except Exception:
+        pass
+
+
 async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
-    await ws.accept()
-    upstream_url = f"{_pi_ws_base()}/{upstream_path.lstrip('/')}"
+    upstream_url = _build_upstream_ws_url(ws, upstream_path)
     headers = _auth_headers()
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        try:
-            async with client.ws_connect(
-                upstream_url,
-                headers=headers,
-                ping_interval=20,
-                ping_timeout=20,
-                timeout=20,
-            ) as up:
+    logger.info("Connecting upstream websocket: %s", upstream_url)
 
-                async def client_to_upstream() -> None:
+    try:
+        async with websockets.connect(
+            upstream_url,
+            additional_headers=headers if headers else None,
+            ping_interval=20,
+            ping_timeout=20,
+            open_timeout=20,
+            close_timeout=10,
+            max_size=None,
+        ) as upstream:
+            await ws.accept()
+            logger.info("WebSocket relay established: client <-> %s", upstream_url)
+
+            async def client_to_upstream() -> None:
+                try:
+                    while True:
+                        msg = await ws.receive()
+
+                        if msg["type"] == "websocket.disconnect":
+                            logger.info("Client websocket disconnected")
+                            break
+
+                        if msg.get("text") is not None:
+                            await upstream.send(msg["text"])
+                        elif msg.get("bytes") is not None:
+                            await upstream.send(msg["bytes"])
+                except WebSocketDisconnect:
+                    logger.info("Client websocket disconnected via WebSocketDisconnect")
+                except Exception:
+                    logger.exception("Error forwarding client -> upstream")
+                finally:
                     try:
-                        while True:
-                            msg = await ws.receive()
-                            if msg.get("type") == "websocket.disconnect":
-                                break
-                            if msg.get("text") is not None:
-                                await up.send_text(msg["text"])
-                            elif msg.get("bytes") is not None:
-                                await up.send_bytes(msg["bytes"])
-                    except WebSocketDisconnect:
-                        pass
+                        await upstream.close()
                     except Exception:
                         pass
 
-                async def upstream_to_client() -> None:
-                    try:
-                        while True:
-                            m = await up.receive()
-                            if m.type == httpx.WSMsgType.TEXT:
-                                await ws.send_text(m.data)
-                            elif m.type == httpx.WSMsgType.BINARY:
-                                await ws.send_bytes(m.data)
-                            else:
-                                break
-                    except Exception:
-                        pass
+            async def upstream_to_client() -> None:
+                try:
+                    async for message in upstream:
+                        if isinstance(message, bytes):
+                            await ws.send_bytes(message)
+                        else:
+                            await ws.send_text(message)
+                except Exception:
+                    logger.exception("Error forwarding upstream -> client")
+                finally:
+                    await _safe_close_ws(ws, code=1011, reason="Upstream websocket closed")
 
-                import asyncio
+            t1 = asyncio.create_task(client_to_upstream())
+            t2 = asyncio.create_task(upstream_to_client())
 
-                t1 = asyncio.create_task(client_to_upstream())
-                t2 = asyncio.create_task(upstream_to_client())
-                _, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-                for p in pending:
-                    p.cancel()
+            done, pending = await asyncio.wait(
+                {t1, t2},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-        except Exception:
-            try:
-                await ws.close()
-            except Exception:
-                pass
+            for task in pending:
+                task.cancel()
+
+            for task in done:
+                try:
+                    await task
+                except Exception:
+                    logger.exception("WebSocket relay task failed")
+
+    except Exception as e:
+        logger.exception("Failed to establish upstream websocket")
+        await _safe_close_ws(ws, code=1011, reason=f"Upstream connection failed: {type(e).__name__}")
 
 
 @app.websocket("/ws/audio")
@@ -240,5 +283,4 @@ async def ws_audio(ws: WebSocket) -> None:
 
 @app.websocket("/ws/sensors")
 async def ws_sensors(ws: WebSocket) -> None:
-    # Optional: if you implement Pi /ws/sensors
     await _ws_passthrough(ws, "/ws/sensors")
