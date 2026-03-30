@@ -2,18 +2,10 @@
 
 let socket;
 
-// Live-audio "intent" (separate from actual connected state)
-let audioDesired = false;
-
-// Retry state
-let _wsRetryTimer = null;
-let _wsRetryCount = 0;
-
-// Connection attempt guard (prevents stale socket callbacks)
-let _wsConnSeq = 0;
-
 const CONFIG = {
-  temp: { min: 28.0, max: 32.0 },
+  temp: { min: 28.0, max: 33.0 },
+  hum: { min: 55, max: 65 },
+  weight: 14.5,
 };
 
 const CONFIG_BASE =
@@ -565,197 +557,656 @@ function resampleLinear(input, inRate, outRate) {
   return output;
 }
 
-// ... (unchanged code continues until closeVideoModal)
+function initChart() {
+  const canvas = document.getElementById("hiveChart");
+  if (!canvas) return;
+
+  const ctx = canvas.getContext("2d");
+  hiveChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        { label: "Temp", data: [], borderColor: "#ff7675", tension: 0.4, pointRadius: 0, yAxisID: "y" },
+        { label: "Hum", data: [], borderColor: "#74b9ff", tension: 0.4, pointRadius: 0, yAxisID: "y" },
+        { label: "Weight", data: [], borderColor: "#ffeaa7", tension: 0.4, pointRadius: 0, yAxisID: "y1" },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: { legend: { display: true, position: "bottom", labels: { boxWidth: 10 } } },
+      scales: {
+        x: { display: false },
+        y: { display: false, position: "left" },
+        y1: { display: false, position: "right", grid: { drawOnChartArea: false } },
+      },
+      animation: false,
+    },
+  });
+}
+
+function _extractTempHumWeight(data) {
+  const temp = data?.temp_c ?? data?.temp ?? data?.temperature ?? null;
+  const hum = data?.hum_pct ?? data?.hum ?? data?.humidity ?? null;
+
+  let weight = data?.weight_kg ?? data?.weight ?? null;
+  const weight_g = data?.weight_g ?? null;
+
+  if ((weight === null || weight === undefined) && weight_g !== null && weight_g !== undefined) {
+    const g = Number(weight_g);
+    if (!Number.isNaN(g)) weight = g / 1000.0;
+  }
+  return { temp, hum, weight };
+}
+
+function getHighestCameraDetection(detections) {
+  if (!Array.isArray(detections) || !detections.length) return null;
+  return [...detections].sort((a, b) => Number(b.conf || 0) - Number(a.conf || 0))[0];
+}
+
+function updateAudioModalStatus() {
+  const topClass = document.getElementById("audio-modal-top-class");
+  const topConf = document.getElementById("audio-modal-top-conf");
+  const alertMode = document.getElementById("audio-modal-alert-mode");
+  const colonyNote = document.getElementById("audio-modal-colony-note");
+  const scoreList = document.getElementById("audio-score-list");
+
+  if (topClass) topClass.innerText = prettyAudioClass(latestAudioClass);
+  if (topConf) topConf.innerText = `Confidence: ${formatPercent(latestAudioConf)}`;
+  if (alertMode) alertMode.innerText = latestAudioAlert ? "Alert" : latestLogOnly ? "Log Only" : "No Alert";
+  if (colonyNote) colonyNote.innerText = `Colony state: ${latestColonyState || "normal_activity"}`;
+
+  if (!scoreList) return;
+
+  if (!latestAudioScores.length) {
+    scoreList.innerHTML = '<div class="empty-detection">Waiting for audio classification...</div>';
+    return;
+  }
+
+  scoreList.innerHTML = latestAudioScores
+    .map((item) => {
+      const conf = Number(item.conf || 0);
+      return `
+        <div class="score-item">
+          <div class="score-head">
+            <span>${prettyAudioClass(item.class)}</span>
+            <strong>${formatPercent(conf)}</strong>
+          </div>
+          <div class="score-bar">
+            <div class="score-fill" style="width:${Math.max(0, Math.min(100, conf * 100))}%"></div>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function updateVideoModalStatus() {
+  const topDetection = document.getElementById("video-top-detection");
+  const topMeta = document.getElementById("video-top-meta");
+  const detectionList = document.getElementById("video-detection-list");
+
+  const top = getHighestCameraDetection(latestCameraDetections);
+
+  if (topDetection) topDetection.innerText = top ? prettyCameraClass(top.class) : prettyCameraClass(latestCameraClass);
+
+  let metaParts = [];
+  metaParts.push(`Confidence: ${top ? formatPercent(top.conf) : formatPercent(latestCameraConf)}`);
+  if (latestCameraAlert) metaParts.push("Mode: Alert + Log");
+  else if (latestCameraLogOnly) metaParts.push("Mode: Log Only");
+  else metaParts.push("Mode: Monitor");
+
+  if (topMeta) topMeta.innerText = metaParts.join(" • ");
+
+  if (!detectionList) return;
+
+  if (!latestCameraDetections.length) {
+    detectionList.innerHTML = '<div class="empty-detection">Waiting for detections...</div>';
+    return;
+  }
+
+  detectionList.innerHTML = latestCameraDetections
+    .map((det) => {
+      const bbox = Array.isArray(det.bbox) ? det.bbox.join(", ") : "--";
+      const cls = normalizeCameraClass(det.class);
+      const mode =
+        cls === "person" || cls === "other_insect"
+          ? "Alert + Log"
+          : cls === "tb_cluster" || cls === "t_biroi" || cls === "vertebrate"
+          ? "Log Only"
+          : "Monitor";
+      return `
+        <div class="detection-chip">
+          <div class="det-main">
+            <strong>${prettyCameraClass(det.class)}</strong>
+            <span>${formatPercent(det.conf)}</span>
+          </div>
+          <small>${mode} • BBox: ${bbox}</small>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function _pushHistoryPoint(timeLabel, tNum, hNum, wNum) {
+  timeLabels.push(timeLabel);
+  tempHistory.push(tNum);
+  humHistory.push(hNum);
+  weightHistory.push(wNum);
+
+  if (timeLabels.length > MAX_HISTORY) {
+    timeLabels.shift();
+    tempHistory.shift();
+    humHistory.shift();
+    weightHistory.shift();
+  }
+}
+
+async function updateData() {
+  if (isFetchingLatest) return;
+  isFetchingLatest = true;
+
+  let t = "--";
+  let h = "--";
+  let rawW = 0;
+
+  let audioClass = latestAudioClass || "normal";
+  let cameraClass = latestCameraClass || "bee";
+  let colonyState = latestColonyState || "normal_activity";
+  let audioConf = latestAudioConf || 0;
+  let cameraConf = latestCameraConf || 0;
+  let audioScores = Array.isArray(latestAudioScores) ? latestAudioScores : [];
+  let cameraDetections = Array.isArray(latestCameraDetections) ? latestCameraDetections : [];
+  let audioAlert = !!latestAudioAlert;
+  let logOnly = !!latestLogOnly;
+  let cameraAlert = !!latestCameraAlert;
+  let cameraLogOnly = !!latestCameraLogOnly;
+  let lastAudioTs = Number(latestLastAudioTs || 0);
+  let lastVideoTs = Number(latestLastVideoTs || 0);
+
+  let isOffline = false;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    let response;
+    try {
+      response = await fetch(RPI_URL, { signal: controller.signal, cache: "no-store" });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    if (!response.ok) throw new Error(`RPi Error: HTTP ${response.status}`);
+
+    const data = await response.json();
+
+    const extracted = _extractTempHumWeight(data);
+    t = extracted.temp !== null && extracted.temp !== undefined ? Number.parseFloat(extracted.temp).toFixed(1) : "--";
+    h = extracted.hum !== null && extracted.hum !== undefined ? Number.parseFloat(extracted.hum).toFixed(0) : "--";
+    rawW = extracted.weight !== null && extracted.weight !== undefined ? Number.parseFloat(extracted.weight) : 0;
+
+    audioClass = normalizeAudioClass(data.audio_class ?? data.sound_status ?? "normal");
+    cameraClass = normalizeCameraClass(data.camera_class ?? data.vision_class ?? data.detected_object ?? "bee");
+
+    colonyState = data.colony_state || colonyState;
+    audioConf = Number(data.audio_conf || 0);
+    cameraConf = Number(data.camera_conf || 0);
+    audioScores = Array.isArray(data.audio_scores) ? data.audio_scores : [];
+    cameraDetections = Array.isArray(data.camera_detections) ? data.camera_detections : [];
+    audioAlert = Boolean(data.audio_alert);
+    logOnly = Boolean(data.log_only);
+    cameraAlert = Boolean(data.camera_alert);
+    cameraLogOnly = Boolean(data.camera_log_only);
+    lastAudioTs = Number(data.last_audio_analysis_ts || 0);
+    lastVideoTs = Number(data.last_video_analysis_ts || 0);
+
+    latestAudioClass = audioClass;
+    latestAudioConf = audioConf;
+    latestAudioScores = audioScores;
+    latestCameraClass = cameraClass;
+    latestCameraConf = cameraConf;
+    latestCameraDetections = cameraDetections;
+    latestColonyState = colonyState;
+    latestAudioAlert = audioAlert;
+    latestLogOnly = logOnly;
+    latestCameraAlert = cameraAlert;
+    latestCameraLogOnly = cameraLogOnly;
+    latestLastAudioTs = lastAudioTs;
+    latestLastVideoTs = lastVideoTs;
+  } catch (error) {
+    isOffline = true;
+    if (error?.name === "AbortError") console.warn("updateData timed out");
+    else console.error("Connection Failed:", error);
+    t = "--";
+    h = "--";
+    rawW = 0;
+  } finally {
+    isFetchingLatest = false;
+  }
+
+  let netW = 0,
+    displayW = "--";
+  if (!Number.isNaN(rawW) && !isOffline) {
+    netW = rawW - HIVE_TARE_WEIGHT;
+    if (netW < 0) netW = 0;
+    displayW = netW.toFixed(2);
+  }
+
+  currentTemp = t;
+  currentHum = h;
+  currentWeight = displayW;
+
+  const tempDisplayEl = document.getElementById("temp-display");
+  const humDisplayEl = document.getElementById("hum-display");
+  const weightDisplayEl = document.getElementById("weight-display");
+
+  if (tempDisplayEl) tempDisplayEl.innerText = `${t}°C`;
+  if (humDisplayEl) humDisplayEl.innerText = `${h}%`;
+  if (weightDisplayEl) weightDisplayEl.innerText = `${displayW} kg`;
+
+  applyAIStatuses(audioClass, cameraClass, colonyState, audioAlert, logOnly, cameraAlert, cameraLogOnly);
+
+  if (tempDisplayEl) {
+    const tNum = Number.parseFloat(t);
+    if (!isOffline && Number.isFinite(tNum) && tNum > CONFIG.temp.max) {
+      tempDisplayEl.style.color = "#ff4757";
+      if (!alarmInterval) showAcousticAlert(`🔥 HIGH HEAT: ${t}°C`, "🔥 HIGH TEMPERATURE!");
+    } else {
+      tempDisplayEl.style.color = "";
+    }
+  }
+
+  if (!isOffline) {
+    const tNum = Number.parseFloat(t);
+    const hNum = Number.parseFloat(h);
+
+    if (Number.isFinite(tNum) && Number.isFinite(hNum)) {
+      const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      _pushHistoryPoint(time, tNum, hNum, netW);
+    }
+
+    if (hiveChart) {
+      hiveChart.data.labels = timeLabels;
+      hiveChart.data.datasets[0].data = tempHistory;
+      hiveChart.data.datasets[1].data = humHistory;
+      hiveChart.data.datasets[2].data = weightHistory;
+      hiveChart.update("none");
+    }
+
+    const detailedModal = document.getElementById("detailed-graph-modal");
+    if (detailedChart && detailedModal && !detailedModal.classList.contains("hidden")) {
+      const title = document.getElementById("detailed-graph-title").innerText;
+      if (title.includes("Temperature")) updateDetailedChart(tempHistory, timeLabels);
+      else if (title.includes("Humidity")) updateDetailedChart(humHistory, timeLabels);
+      else if (title.includes("Weight")) updateDetailedChart(weightHistory, timeLabels);
+    }
+
+    if (shouldRaiseAlert(audioClass, cameraClass, colonyState, audioAlert, cameraAlert)) {
+      if (!alarmInterval) maybeTriggerAIAlert(audioClass, cameraClass, colonyState, audioAlert, cameraAlert);
+    }
+  }
+
+  const highestCameraConf = getHighestCameraDetection(cameraDetections)?.conf || cameraConf || 0;
+  const highestConf = Math.max(audioConf, highestCameraConf);
+
+  if (!isOffline && Math.random() > 0.8) {
+    let logStatus = "Normal";
+    let logEvent = `Audio: ${prettyAudioClass(audioClass)} | Camera: ${prettyCameraClass(cameraClass)}`;
+
+    if (audioAlert || cameraAlert) logStatus = "Warning";
+    else if (logOnly || cameraLogOnly) logStatus = "Logged";
+
+    if (audioClass === "swarming") {
+      logStatus = "Warning";
+      logEvent = "Audio: Swarming / Ready for Split";
+    }
+    if (audioClass === "queenless") {
+      logStatus = "Logged";
+      logEvent = "Audio: Queenless state detected";
+    }
+    if (audioClass === "queenright") {
+      logStatus = "Logged";
+      logEvent = "Audio: Queenright state detected";
+    }
+    if (audioClass === "false") {
+      logStatus = "Logged";
+      logEvent = "Audio: False trigger recorded";
+    }
+
+    if (cameraClass === "person") {
+      logStatus = "Warning";
+      logEvent = "Video: Person detected";
+    }
+    if (cameraClass === "other_insect") {
+      logStatus = "Warning";
+      logEvent = "Video: Other insect detected";
+    }
+    if (cameraClass === "tb_cluster") {
+      logStatus = "Logged";
+      logEvent = "Video: TB cluster detected";
+    }
+    if (cameraClass === "t_biroi") {
+      logStatus = "Logged";
+      logEvent = "Video: T. biroi detected";
+    }
+    if (cameraClass === "vertebrate") {
+      logStatus = "Logged";
+      logEvent = "Video: Vertebrate detected";
+    }
+
+    const tNum = Number.parseFloat(t);
+    if (Number.isFinite(tNum) && tNum > CONFIG.temp.max) {
+      logStatus = "Warning";
+      logEvent = "Env: High Temp";
+    }
+
+    const statusClass = logStatus === "Normal" ? "badge-normal" : logStatus === "Logged" ? "badge-logonly" : "badge-warning";
+
+    const tbody = document.querySelector("#logs-table tbody");
+    if (tbody) {
+      const row = `
+        <tr>
+          <td>${new Date().toLocaleTimeString()}</td>
+          <td>${logEvent}</td>
+          <td>${t}°C / ${h}% / ${displayW}kg</td>
+          <td class="conf-text">${highestConf > 0 ? `${(highestConf * 100).toFixed(0)}%` : "0%"}</td>
+          <td><span class="log-badge ${statusClass}">${logStatus}</span></td>
+        </tr>
+      `;
+      tbody.insertAdjacentHTML("afterbegin", row);
+      if (tbody.rows.length > 20) tbody.deleteRow(20);
+    }
+
+    allLogs.unshift({
+      timestamp: new Date().toLocaleString(),
+      eventType: logEvent,
+      value: `${t}°C | ${displayW}kg`,
+      status: logStatus,
+    });
+  }
+
+  updateAudioModalStatus();
+  updateVideoModalStatus();
+
+  if (cameraDetections.length) {
+    const topDet = getHighestCameraDetection(cameraDetections);
+    if (topDet) {
+      const normalized = normalizeCameraClass(topDet.class);
+      if (normalized === "person" || normalized === "other_insect") {
+        pushVideoLog(`${prettyCameraClass(topDet.class)} detected`, "Warning");
+      } else if (normalized === "tb_cluster" || normalized === "t_biroi" || normalized === "vertebrate") {
+        pushVideoLog(`${prettyCameraClass(topDet.class)} logged`, "Logged");
+      }
+    }
+  }
+
+  if (audioAlert) pushAudioLog(`${prettyAudioClass(audioClass)} detected`, "High");
+  else if (logOnly) pushAudioLog(`${prettyAudioClass(audioClass)} logged`, "Normal");
+}
+
+function startDataUpdates() {
+  if (updateIntervalId) clearInterval(updateIntervalId);
+  const rate = SETTINGS.refreshRate || 2000;
+  updateIntervalId = setInterval(updateData, rate);
+}
+
+function manualRefresh() {
+  const icon = document.querySelector(".refresh-btn-global i");
+  if (icon) icon.classList.add("fa-spin");
+
+  updateData().then(() => {
+    setTimeout(() => {
+      if (icon) icon.classList.remove("fa-spin");
+    }, 800);
+  });
+}
+
+function toggleDashboardMenu() {
+  const menu = document.getElementById("dashboard-mobile-dropdown");
+  if (menu) menu.classList.toggle("hidden");
+}
+
+function saveSettings() {
+  const refreshEl = document.getElementById("setting-refresh");
+  const audioEl = document.getElementById("setting-audio");
+  const sensitivityEl = document.getElementById("setting-sensitivity");
+
+  if (refreshEl) SETTINGS.refreshRate = parseInt(refreshEl.value, 10);
+  if (audioEl) SETTINGS.audioEnabled = audioEl.checked;
+  if (sensitivityEl) SETTINGS.sensitivity = parseInt(sensitivityEl.value, 10);
+
+  localStorage.setItem("hive_settings", JSON.stringify(SETTINGS));
+  startDataUpdates();
+  alert("✅ Settings Saved!");
+}
+
+function resetSettings() {
+  localStorage.removeItem("hive_settings");
+  location.reload();
+}
+
+function exportData() {
+  if (allLogs.length === 0) return alert("⚠️ No logs to export!");
+
+  let csvContent = "Timestamp,Event,Value,Status\n";
+  allLogs.forEach((log) => {
+    csvContent += `"${log.timestamp}","${log.eventType}","${log.value}","${log.status}"\n`;
+  });
+
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.setAttribute("href", url);
+  link.setAttribute("download", `hive_data_${new Date().toISOString().slice(0, 10)}.csv`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+function openDetailedGraphOnCardClick(type) {
+  const modal = document.getElementById("detailed-graph-modal");
+  if (!modal) return;
+
+  modal.classList.remove("hidden");
+
+  let title, color, dataArray;
+  if (type === "temp") {
+    title = "Temperature Trend";
+    color = "#ff7675";
+    dataArray = tempHistory;
+  } else if (type === "humidity") {
+    title = "Humidity Trend";
+    color = "#74b9ff";
+    dataArray = humHistory;
+  } else if (type === "weight") {
+    title = "Weight Trend";
+    color = "#ffeaa7";
+    dataArray = weightHistory;
+  } else {
+    return;
+  }
+
+  document.getElementById("detailed-graph-title").innerText = title;
+  if (detailedChart) detailedChart.destroy();
+
+  const canvas = document.getElementById("detailedChart");
+  if (!canvas) return;
+
+  const ctx = canvas.getContext("2d");
+  detailedChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: timeLabels,
+      datasets: [
+        {
+          label: title,
+          data: dataArray,
+          borderColor: color,
+          backgroundColor: hexToRgba(color, 0.15),
+          fill: true,
+          tension: 0.4,
+          pointRadius: 4,
+          pointBackgroundColor: color,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: false } },
+    },
+  });
+
+  updateDetailedStats(dataArray);
+}
+
+function updateDetailedChart(dataArray, labels) {
+  if (!detailedChart) return;
+  detailedChart.data.labels = labels;
+  detailedChart.data.datasets[0].data = dataArray;
+  detailedChart.update("none");
+  updateDetailedStats(dataArray);
+}
+
+function updateDetailedStats(dataArray) {
+  if (!dataArray || dataArray.length === 0) return;
+
+  const nums = dataArray.map((n) => parseFloat(n)).filter((n) => !isNaN(n));
+  if (nums.length === 0) return;
+
+  const sum = nums.reduce((a, b) => a + b, 0);
+  const avg = (sum / nums.length).toFixed(2);
+
+  document.getElementById("graph-current").innerText = nums[nums.length - 1].toFixed(2);
+  document.getElementById("graph-max").innerText = Math.max(...nums).toFixed(2);
+  document.getElementById("graph-min").innerText = Math.min(...nums).toFixed(2);
+  document.getElementById("graph-avg").innerText = avg;
+}
+
+function closeDetailedGraphModal() {
+  document.getElementById("detailed-graph-modal").classList.add("hidden");
+}
+
+function switchPublicTab(tabId) {
+  document.querySelectorAll(".public-section").forEach((sec) => sec.classList.add("hidden"));
+  document.getElementById(tabId).classList.remove("hidden");
+  if (tabId === "hero") window.scrollTo(0, 0);
+}
+
+function toggleMobileMenu() {
+  document.getElementById("mobile-public-menu").classList.toggle("hidden");
+}
+
+function mobileNavClick(tabId) {
+  switchPublicTab(tabId);
+  toggleMobileMenu();
+}
+
+function loadAlertState() {
+  alertAcknowledged = localStorage.getItem("hive_alert_acknowledged") === "true";
+}
+
+function setAlertAcknowledged(value) {
+  alertAcknowledged = !!value;
+  if (alertAcknowledged) localStorage.setItem("hive_alert_acknowledged", "true");
+  else localStorage.removeItem("hive_alert_acknowledged");
+}
+
+function resetAlertState() {
+  setAlertAcknowledged(false);
+  lastAlertKey = "";
+  document.getElementById("alert-modal")?.classList.add("hidden");
+  document.getElementById("alert-notification")?.classList.add("hidden");
+  stopAlarmSound();
+}
+
+function goToLogin() {
+  document.getElementById("landing-view").classList.add("hidden");
+  document.getElementById("login-view").classList.remove("hidden");
+  document.getElementById("mobile-nav-bar").classList.add("hidden");
+}
+
+function backToHome() {
+  document.getElementById("login-view").classList.add("hidden");
+  document.getElementById("landing-view").classList.remove("hidden");
+}
+
+function attemptLogin() {
+  const email = document.getElementById("email-input").value.trim().toLowerCase();
+  const password = document.getElementById("password-input").value.trim();
+
+  if (email.endsWith("@gmail.com") && password === "hive123") {
+    localStorage.setItem("hive_isLoggedIn", "true");
+    location.reload();
+  } else {
+    document.getElementById("login-error").classList.remove("hidden");
+  }
+}
+
+function logout() {
+  localStorage.removeItem("hive_isLoggedIn");
+  location.reload();
+}
+
+function switchTab(tabId) {
+  document.querySelectorAll(".view-section").forEach((sec) => sec.classList.add("hidden"));
+  document.getElementById("view-" + tabId).classList.remove("hidden");
+
+  document.querySelectorAll(".nav-menu li, .nav-bottom li, .mobile-nav div").forEach((item) => item.classList.remove("active"));
+  document.querySelectorAll(".nav-item-" + tabId).forEach((item) => item.classList.add("active"));
+}
+
+function stopVideoStream() {
+  const img = document.getElementById("cctv-feed");
+  if (!img) return;
+  img.src = "about:blank";
+  img.removeAttribute("src");
+  img.style.display = "none";
+}
+
+function openVideoModal() {
+  document.getElementById("video-modal").classList.remove("hidden");
+
+  const img = document.getElementById("cctv-feed");
+  if (!img) return;
+
+  img.src = `${RPI_VIDEO_URL}?t=${Date.now()}`;
+  img.style.display = "block";
+
+  const err = document.getElementById("video-error-msg");
+  if (err) err.remove();
+
+  updateVideoModalStatus();
+  populateVideoLogs();
+}
 
 function closeVideoModal() {
-    document.getElementById("video-modal").classList.add("hidden");
-    stopVideoStream();
-    stopAudio();
-}
-
-function _setAudioStatus(text) {
-  const statusLabel = document.getElementById("audio-level-label");
-  if (statusLabel) statusLabel.innerText = text;
-}
-
-function _clearWsRetry() {
-  if (_wsRetryTimer) {
-    clearTimeout(_wsRetryTimer);
-    _wsRetryTimer = null;
-  }
-  _wsRetryCount = 0;
-}
-
-/**
- * Exponential backoff + jitter to avoid tight reconnect loops.
- */
-function _scheduleWsRetry(reason = "") {
-  if (!audioDesired) return;
-  if (_wsRetryTimer) return;
-
-  const base = 1000 * 2 ** _wsRetryCount;
-  const capped = Math.min(base, 15000);
-
-  const delay = Math.round(capped * (0.8 + Math.random() * 0.4)); // +/- 20% jitter
-  _wsRetryCount = Math.min(_wsRetryCount + 1, 6);
-
-  _setAudioStatus(`Status: Reconnecting in ${Math.ceil(delay / 1000)}s...${reason ? ` (${reason})` : ""}`);
-  updateAudioButtonState(true);
-
-  _wsRetryTimer = setTimeout(() => {
-    _wsRetryTimer = null;
-    if (!audioDesired) return;
-    startAudioSocket();
-  }, delay);
-}
-
-function startAudioSocket() {
-  if (!audioDesired) return;
-
-  if (audioSocket && (audioSocket.readyState === WebSocket.OPEN || audioSocket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-
-  const mySeq = ++_wsConnSeq;
-  _setAudioStatus("Status: Connecting...");
-  updateAudioButtonState(true);
-
-  let ws;
-  try {
-    ws = new WebSocket(RPI_AUDIO_WS_URL);
-    ws.binaryType = "arraybuffer";
-  } catch (e) {
-    console.error("WS create failed:", e);
-    _scheduleWsRetry("create failed");
-    return;
-  }
-
-  audioSocket = ws;
-
-  const connectTimeoutMs = 15000;
-  const connectTimer = setTimeout(() => {
-    if (mySeq !== _wsConnSeq) return;
-    if (ws.readyState !== WebSocket.OPEN) {
-      try {
-        ws.close(4000, "connect timeout");
-      } catch {}
-    }
-  }, connectTimeoutMs);
-
-  ws.onopen = () => {
-    if (mySeq !== _wsConnSeq) {
-      try {
-        ws.close(4001, "stale socket");
-      } catch {}
-      return;
-    }
-
-    clearTimeout(connectTimer);
-    _clearWsRetry();
-
-    _ensureAudioRing();
-
-    isListening = true;
-    audioDrawMode = "live";
-
-    updateAudioButtonState(true);
-    updateAudioCardStatus("Live", "#2ecc71");
-    _setAudioStatus("Status: Live");
-    pushAudioLog("Live audio stream connected", "Normal");
-
-    try {
-      ws.send("start");
-    } catch {}
-  };
-
-  ws.onmessage = (event) => {
-    if (mySeq !== _wsConnSeq) return;
-    if (event.data && event.data.byteLength > 0) playRawAudioBuffer(event.data);
-  };
-
-  ws.onerror = (err) => {
-    if (mySeq !== _wsConnSeq) return;
-    console.warn("WS error:", err);
-  };
-
-  ws.onclose = (event) => {
-    if (mySeq !== _wsConnSeq) return;
-
-    clearTimeout(connectTimer);
-    if (audioSocket === ws) audioSocket = null;
-
-    isListening = false;
-    audioDrawMode = "waiting";
-
-    if (!audioDesired) {
-      updateAudioButtonState(false);
-      updateAudioCardStatus(prettyAudioClass(latestAudioClass), getAudioColor(latestAudioClass));
-      _setAudioStatus("Status: Ready");
-      pushAudioLog("Live audio stopped", "Normal");
-      return;
-    }
-
-    audioDrawMode = "error";
-    updateAudioCardStatus("Reconnecting...", "#f7b731");
-    pushAudioLog(`Live audio disconnected (code ${event.code || 0})`, "Warning");
-
-    _scheduleWsRetry(`code ${event.code || 0}`);
-  };
-}
-
-function stopAudio() {
-  audioDesired = false;
-  _clearWsRetry();
-
-  // Invalidate in-flight callbacks
-  _wsConnSeq++;
-
-  if (audioSocket) {
-    try {
-      audioSocket.onopen = null;
-      audioSocket.onmessage = null;
-      audioSocket.onerror = null;
-      audioSocket.onclose = null;
-      audioSocket.close(1000, "user stop");
-    } catch {}
-    audioSocket = null;
-  }
-
-  const audioTag = document.getElementById("live-audio-player");
-  if (audioTag) {
-    audioTag.pause();
-    audioTag.src = "";
-    audioTag.load();
-  }
-
-  isListening = false;
-  audioDrawMode = "waiting";
-  audioWaveData = null;
-
-  updateAudioButtonState(false);
-  updateAudioCardStatus(prettyAudioClass(latestAudioClass), getAudioColor(latestAudioClass));
-  _setAudioStatus("Status: Ready");
+  document.getElementById("video-modal").classList.add("hidden");
+  stopVideoStream();
+  stopAudio();
 }
 
 async function toggleAudio() {
+  const statusLabel = document.getElementById("audio-level-label");
+
   try {
-    if (!audioDesired) {
-      audioDesired = true;
-      updateAudioButtonState(true);
-      _setAudioStatus("Status: Connecting...");
+    if (!isListening) {
       await ensureAudioContextRunning();
       startAudioSocket();
+      if (statusLabel) statusLabel.innerText = "Status: Connecting...";
     } else {
       stopAudio();
     }
   } catch (err) {
-    console.error("toggleAudio failed:", err);
-    stopAudio();
-    alert("Please interact with the page first to enable audio.");
+    if (statusLabel) statusLabel.innerText = "Status: Unable to start";
+    pushAudioLog("Live audio failed to start", "Warning");
+    alert("Please interact with the page first to enable live audio.");
   }
 }
-
-// ... rest of your original file remains unchanged ...
 
 let _wsRetryTimer = null;
 let _wsRetryCount = 0;
