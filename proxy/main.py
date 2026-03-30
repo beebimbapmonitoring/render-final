@@ -13,23 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
-"""
-Memory-only Render Proxy (Free plan friendly)
-
-- Stores current PI_HTTP_BASE in memory (no persistent disk).
-- Set it via POST /admin/set-pi (secured by ADMIN_TOKEN).
-- Proxies:
-  GET /api/latest        -> Pi /api/latest (should include sensors)
-  GET /api/sensors       -> Pi /api/sensors (optional)
-  GET /video.mjpg        -> Pi /video.mjpg
-  WS  /ws/audio          -> Pi /ws/audio
-  WS  /ws/sensors        -> Pi /ws/sensors (optional)
-
-Security:
-- If PI_API_TOKEN is set, proxy adds: Authorization: Bearer <token> to Pi requests.
-- Put PI_HTTP_BASE = https://your-pi-public-url in Render env for Funnel/public access.
-"""
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("render-proxy")
 
@@ -43,7 +26,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this in production if you know your frontend origin
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -51,9 +34,6 @@ app.add_middleware(
 
 @app.middleware("http")
 async def always_cors(request: Request, call_next):
-    """
-    Keeps CORS headers even when errors happen, so browser can read error responses.
-    """
     try:
         resp = await call_next(request)
     except Exception as e:
@@ -144,12 +124,10 @@ async def _forward_get(path: str, timeout_s: float = 8.0) -> Response:
     url = f"{_pi_http_base()}/{path.lstrip('/')}"
     async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
         r = await client.get(url, headers=_auth_headers())
-
-    content_type = r.headers.get("content-type", "application/json")
     return Response(
         content=r.content,
         status_code=r.status_code,
-        media_type=content_type,
+        media_type=r.headers.get("content-type", "application/json"),
     )
 
 
@@ -185,10 +163,9 @@ async def video_mjpg() -> StreamingResponse:
 def _build_upstream_ws_url(ws: WebSocket, upstream_path: str) -> str:
     base = _pi_ws_base()
     path = upstream_path.lstrip("/")
-    query = ws.url.query
     url = f"{base}/{path}"
-    if query:
-        url = f"{url}?{query}"
+    if ws.url.query:
+        url = f"{url}?{ws.url.query}"
     return url
 
 
@@ -223,17 +200,15 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
                 try:
                     while True:
                         msg = await ws.receive()
-
                         if msg["type"] == "websocket.disconnect":
-                            logger.info("Client websocket disconnected")
+                            logger.info("Client disconnected")
                             break
-
                         if msg.get("text") is not None:
                             await upstream.send(msg["text"])
                         elif msg.get("bytes") is not None:
                             await upstream.send(msg["bytes"])
                 except WebSocketDisconnect:
-                    logger.info("Client websocket disconnected via WebSocketDisconnect")
+                    logger.info("Client websocket disconnected")
                 except Exception:
                     logger.exception("Error forwarding client -> upstream")
                 finally:
@@ -269,7 +244,7 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
                 try:
                     await task
                 except Exception:
-                    logger.exception("WebSocket relay task failed")
+                    logger.exception("Relay task failed")
 
     except Exception as e:
         logger.exception("Failed to establish upstream websocket")
