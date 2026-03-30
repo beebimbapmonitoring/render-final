@@ -1,23 +1,24 @@
-// ~/hive-server/public/script.js
-
 let socket;
 
 const CONFIG = {
-    temp: { min: 28.0, max: 33.0 },
-    hum: { min: 55, max: 65 },
-    weight: 14.5,
+  temp: { min: 28.0, max: 33.0 },
+  hum: { min: 55, max: 65 },
+  weight: 14.5,
 };
 
 const CONFIG_BASE =
   (window.BEEROI_CONFIG && String(window.BEEROI_CONFIG.PROXY_BASE_URL || "").trim()) || "";
 
+// If you deploy to Render, you usually want CONFIG_BASE="" so it uses window.location.origin.
+// Keep FUNNEL_ORIGIN as fallback only (dev/local).
 const FUNNEL_ORIGIN =
   (window.__HIVE_FUNNEL_ORIGIN && String(window.__HIVE_FUNNEL_ORIGIN).trim()) ||
   (localStorage.getItem("hive_funnel_origin") || "").trim();
 
-const HTTP_ORIGIN = CONFIG_BASE || FUNNEL_ORIGIN || window.location.origin;
-const WS_ORIGIN = (CONFIG_BASE || FUNNEL_ORIGIN)
-  ? (CONFIG_BASE || FUNNEL_ORIGIN).replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://")
+const HTTP_ORIGIN = CONFIG_BASE || window.location.origin || FUNNEL_ORIGIN;
+
+const WS_ORIGIN = (CONFIG_BASE || window.location.origin)
+  ? (String(CONFIG_BASE || window.location.origin).replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://"))
   : ((window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host);
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
