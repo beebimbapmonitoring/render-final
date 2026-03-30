@@ -1,11 +1,13 @@
 # proxy/main.py
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
+import websockets
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -31,10 +33,12 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 DEFAULT_PI_HTTP_BASE = os.getenv("PI_HTTP_BASE", "").strip().rstrip("/")
 PI_API_TOKEN = os.getenv("PI_API_TOKEN", "").strip()
 
-# In-memory target (changes via /admin/set-pi)
 PI_HTTP_BASE_RUNTIME = DEFAULT_PI_HTTP_BASE
 
-app = FastAPI()
+HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "20"))
+WS_CONNECT_TIMEOUT_S = float(os.getenv("WS_CONNECT_TIMEOUT_S", "20"))
+
+app = FastAPI(title="Hive Proxy (Render → RPi)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,11 +48,25 @@ app.add_middleware(
 )
 
 
+_http: httpx.AsyncClient | None = None
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _http
+    _http = httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_S))
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    global _http
+    if _http:
+        await _http.aclose()
+        _http = None
+
+
 @app.middleware("http")
 async def always_cors(request: Request, call_next):
-    """
-    Ensure CORS headers even on errors (so the browser won't block error visibility).
-    """
     try:
         resp = await call_next(request)
     except Exception as e:
@@ -91,10 +109,16 @@ def _pi_ws_base() -> str:
     return "ws://" + base.removeprefix("http://")
 
 
-def _upstream_headers() -> dict[str, str]:
+def _upstream_headers_httpx() -> dict[str, str]:
     if not PI_API_TOKEN:
         return {}
     return {"Authorization": f"Bearer {PI_API_TOKEN}"}
+
+
+def _upstream_headers_ws() -> list[tuple[str, str]] | None:
+    if not PI_API_TOKEN:
+        return None
+    return [("Authorization", f"Bearer {PI_API_TOKEN}")]
 
 
 @app.get("/health")
@@ -135,9 +159,11 @@ async def admin_set_pi(payload: dict, request: Request) -> Response:
 
 @app.get("/api/latest")
 async def api_latest() -> Response:
+    if _http is None:
+        return JSONResponse({"ok": False, "error": "http client not ready"}, status_code=503)
+
     url = f"{_pi_http_base()}/api/latest"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, headers=_upstream_headers())
+    r = await _http.get(url, headers=_upstream_headers_httpx())
     return Response(
         content=r.content,
         status_code=r.status_code,
@@ -146,9 +172,12 @@ async def api_latest() -> Response:
 
 
 async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
+    if _http is None:
+        return
+
     timeout = httpx.Timeout(connect=10, read=None, write=10, pool=10)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("GET", url, headers=_upstream_headers()) as r:
+        async with client.stream("GET", url, headers=_upstream_headers_httpx()) as r:
             r.raise_for_status()
             async for chunk in r.aiter_bytes():
                 if chunk:
@@ -174,54 +203,52 @@ async def ws_audio(ws: WebSocket) -> None:
     await ws.accept()
     upstream_url = f"{_pi_ws_base()}/ws/audio"
 
-    async with httpx.AsyncClient(timeout=None) as client:
+    try:
+        async with websockets.connect(
+            upstream_url,
+            extra_headers=_upstream_headers_ws(),
+            open_timeout=WS_CONNECT_TIMEOUT_S,
+            ping_interval=20,
+            ping_timeout=20,
+            max_size=None,
+        ) as up:
+
+            async def client_to_upstream() -> None:
+                try:
+                    while True:
+                        msg = await ws.receive()
+                        if msg.get("type") == "websocket.disconnect":
+                            break
+                        if msg.get("text") is not None:
+                            await up.send(msg["text"])
+                        elif msg.get("bytes") is not None:
+                            await up.send(msg["bytes"])
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
+
+            async def upstream_to_client() -> None:
+                try:
+                    while True:
+                        data = await up.recv()
+                        if isinstance(data, (bytes, bytearray)):
+                            await ws.send_bytes(bytes(data))
+                        else:
+                            await ws.send_text(str(data))
+                except Exception:
+                    pass
+
+            t1 = asyncio.create_task(client_to_upstream())
+            t2 = asyncio.create_task(upstream_to_client())
+            _, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+            for p in pending:
+                p.cancel()
+
+    except WebSocketDisconnect:
+        return
+    except Exception:
         try:
-            async with client.ws_connect(
-                upstream_url,
-                headers=_upstream_headers(),
-                ping_interval=20,
-                ping_timeout=20,
-                timeout=20,
-            ) as up:
-
-                async def client_to_upstream() -> None:
-                    try:
-                        while True:
-                            msg = await ws.receive()
-                            if msg.get("type") == "websocket.disconnect":
-                                break
-                            if msg.get("text") is not None:
-                                await up.send_text(msg["text"])
-                            elif msg.get("bytes") is not None:
-                                await up.send_bytes(msg["bytes"])
-                    except WebSocketDisconnect:
-                        pass
-                    except Exception:
-                        pass
-
-                async def upstream_to_client() -> None:
-                    try:
-                        while True:
-                            m = await up.receive()
-                            if m.type == httpx.WSMsgType.TEXT:
-                                await ws.send_text(m.data)
-                            elif m.type == httpx.WSMsgType.BINARY:
-                                await ws.send_bytes(m.data)
-                            else:
-                                break
-                    except Exception:
-                        pass
-
-                import asyncio
-
-                t1 = asyncio.create_task(client_to_upstream())
-                t2 = asyncio.create_task(upstream_to_client())
-                _, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-                for p in pending:
-                    p.cancel()
-
+            await ws.close(code=1011)
         except Exception:
-            try:
-                await ws.close()
-            except Exception:
-                pass
+            pass
