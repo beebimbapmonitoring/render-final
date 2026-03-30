@@ -1,23 +1,24 @@
-// ~/hive-server/public/script.js
-
 let socket;
 
 const CONFIG = {
-    temp: { min: 28.0, max: 33.0 },
-    hum: { min: 55, max: 65 },
-    weight: 14.5,
+  temp: { min: 28.0, max: 33.0 },
+  hum: { min: 55, max: 65 },
+  weight: 14.5,
 };
 
 const CONFIG_BASE =
   (window.BEEROI_CONFIG && String(window.BEEROI_CONFIG.PROXY_BASE_URL || "").trim()) || "";
 
+// If you deploy to Render, you usually want CONFIG_BASE="" so it uses window.location.origin.
+// Keep FUNNEL_ORIGIN as fallback only (dev/local).
 const FUNNEL_ORIGIN =
   (window.__HIVE_FUNNEL_ORIGIN && String(window.__HIVE_FUNNEL_ORIGIN).trim()) ||
   (localStorage.getItem("hive_funnel_origin") || "").trim();
 
-const HTTP_ORIGIN = CONFIG_BASE || FUNNEL_ORIGIN || window.location.origin;
-const WS_ORIGIN = (CONFIG_BASE || FUNNEL_ORIGIN)
-  ? (CONFIG_BASE || FUNNEL_ORIGIN).replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://")
+const HTTP_ORIGIN = CONFIG_BASE || window.location.origin || FUNNEL_ORIGIN;
+
+const WS_ORIGIN = (CONFIG_BASE || window.location.origin)
+  ? (String(CONFIG_BASE || window.location.origin).replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://"))
   : ((window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host);
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
@@ -1170,71 +1171,46 @@ function startAudioSocket() {
         }
     }, connectTimeoutMs);
 
-    let pingInterval = null; // Ilagay ito sa taas o labas ng function
+    audioSocket.onopen = () => {
+        clearTimeout(connectTimer);
 
-audioSocket.onopen = () => {
-    clearTimeout(connectTimer);
-    _wsRetryCount = 0; 
-    isListening = true;
-    audioDrawMode = "live";
-    updateAudioButtonState(true);
-    updateAudioCardStatus("Live", "#2ecc71");
-    if (statusLabel) statusLabel.innerText = "Status: Live";
-    
-    console.log("WebSocket Connected!");
-    
-    // Sabihan ang backend na magsimula
-    audioSocket.send("start");
+        _ensureAudioRing();
 
-    // --- HEARTBEAT LOGIC PARA SA RENDER ---
-    // Magpapadala ng 'ping' bawat 10 seconds para hindi tayo i-disconnect
-    if (pingInterval) clearInterval(pingInterval);
-    pingInterval = setInterval(() => {
-        if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
-            audioSocket.send("ping");
-        }
-    }, 10000);
-};
+        isListening = true;
+        audioDrawMode = "live";
+        updateAudioButtonState(true);
+        updateAudioCardStatus("Live", "#2ecc71");
 
-audioSocket.onmessage = (event) => {
-    // Kapag nakatanggap ng data, i-play ang audio
-    if (event.data) playRawAudioBuffer(event.data);
-};
+        if (statusLabel) statusLabel.innerText = "Status: Live";
+        pushAudioLog("Live audio stream connected", "Normal");
 
-audioSocket.onerror = (err) => {
-    clearTimeout(connectTimer);
-    console.error("WebSocket Error Observed:", err);
-    audioDrawMode = "error";
-    if (statusLabel) statusLabel.innerText = "Status: WS error";
-    updateAudioCardStatus("Error", "#ff4757");
-};
+        try { audioSocket.send("start"); } catch (e) { }
+    };
 
-audioSocket.onclose = () => {
-    clearTimeout(connectTimer);
-    
-    // I-stop ang ping kapag nag-close ang connection
-    if (pingInterval) {
-        clearInterval(pingInterval);
-        pingInterval = null;
-    }
+    audioSocket.onmessage = (event) => {
+        if (event.data) playRawAudioBuffer(event.data);
+    };
 
-    const diedUnexpectedly = isListening; 
-    isListening = false;
-    audioSocket = null;
-    audioDrawMode = "waiting";
-    updateAudioButtonState(false);
-    updateAudioCardStatus(prettyAudioClass(latestAudioClass), getAudioColor(latestAudioClass));
-    
-    if (statusLabel) statusLabel.innerText = "Status: Ready";
-    pushAudioLog("Live audio stream disconnected", "Normal");
+    audioSocket.onerror = () => {
+        clearTimeout(connectTimer);
+        audioDrawMode = "error";
+        if (statusLabel) statusLabel.innerText = "Status: WS error";
+        updateAudioCardStatus("Error", "#ff4757");
+        pushAudioLog("Live audio stream error", "Warning");
+    };
 
-    // Retry logic kung hindi natin sinadyang i-close
-    if (diedUnexpectedly) {
-        console.log("Retrying connection...");
-        _scheduleWsRetry(); 
-    }
-};
-    
+    audioSocket.onclose = () => {
+        clearTimeout(connectTimer);
+        isListening = false;
+        audioSocket = null;
+        audioDrawMode = "waiting";
+        updateAudioButtonState(false);
+        updateAudioCardStatus(prettyAudioClass(latestAudioClass), getAudioColor(latestAudioClass));
+        if (statusLabel) statusLabel.innerText = "Status: Ready";
+        pushAudioLog("Live audio stream disconnected", "Normal");
+    };
+}
+
 function playRawAudioBuffer(data) {
     const ctx = ensureAudioContext();
     if (ctx.state === "suspended") ctx.resume();
