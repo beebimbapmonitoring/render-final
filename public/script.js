@@ -1,30 +1,29 @@
-// ~/hive-server/public/script.js
-
 let socket;
 
 const CONFIG = {
-    temp: { min: 28.0, max: 33.0 },
-    hum: { min: 55, max: 65 },
-    weight: 14.5,
+  temp: { min: 28.0, max: 33.0 },
+  hum: { min: 55, max: 65 },
+  weight: 14.5,
 };
 
-// 1. Siguraduhin na malinis ang Funnel Origin (walang slash sa dulo)
-const cleanFunnel = (typeof FUNNEL_ORIGIN !== 'undefined' && FUNNEL_ORIGIN) 
-    ? FUNNEL_ORIGIN.trim().rstrip("/") 
-    : "";
+const CONFIG_BASE =
+  (window.BEEROI_CONFIG && String(window.BEEROI_CONFIG.PROXY_BASE_URL || "").trim()) || "";
 
-// 2. Pumili sa pagitan ng Funnel o Current Host
-const HTTP_ORIGIN = cleanFunnel || window.location.origin;
+// If you deploy to Render, you usually want CONFIG_BASE="" so it uses window.location.origin.
+// Keep FUNNEL_ORIGIN as fallback only (dev/local).
+const FUNNEL_ORIGIN =
+  (window.__HIVE_FUNNEL_ORIGIN && String(window.__HIVE_FUNNEL_ORIGIN).trim()) ||
+  (localStorage.getItem("hive_funnel_origin") || "").trim();
 
-// 3. Ayusin ang WS_ORIGIN base sa napiling HTTP_ORIGIN
-const WS_ORIGIN = HTTP_ORIGIN.replace(/^http/, "ws"); 
+const HTTP_ORIGIN = CONFIG_BASE || window.location.origin || FUNNEL_ORIGIN;
 
-// 4. Construct Final URLs (Siguraduhin na walang double slashes)
+const WS_ORIGIN = (CONFIG_BASE || window.location.origin)
+  ? (String(CONFIG_BASE || window.location.origin).replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://"))
+  : ((window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host);
+
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
 const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
-
-console.log("Using API URL:", RPI_URL); // I-check mo ito sa console kung tama
 
 const HIVE_TARE_WEIGHT = 2.0;
 
