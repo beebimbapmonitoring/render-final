@@ -1156,18 +1156,26 @@ async function toggleAudio() {
 }
 
 function startAudioSocket() {
-    if (audioSocket && audioSocket.readyState === WebSocket.OPEN) return;
+    if (
+        audioSocket &&
+        (audioSocket.readyState === WebSocket.OPEN ||
+         audioSocket.readyState === WebSocket.CONNECTING)
+    ) {
+        return;
+    }
 
     const statusLabel = document.getElementById("audio-level-label");
 
     audioSocket = new WebSocket(RPI_AUDIO_WS_URL);
     audioSocket.binaryType = "arraybuffer";
 
-    const connectTimeoutMs = 4000;
+    const connectTimeoutMs = 6000;
     const connectTimer = setTimeout(() => {
-        if (audioSocket && audioSocket.readyState !== WebSocket.OPEN) {
+        if (audioSocket &&
+            audioSocket.readyState !== WebSocket.OPEN &&
+            audioSocket.readyState !== WebSocket.CLOSED) {
             if (statusLabel) statusLabel.innerText = "Status: WS timeout";
-            try { audioSocket.close(); } catch (e) { }
+            try { audioSocket.close(); } catch (e) {}
         }
     }, connectTimeoutMs);
 
@@ -1175,7 +1183,6 @@ function startAudioSocket() {
         clearTimeout(connectTimer);
 
         _ensureAudioRing();
-
         isListening = true;
         audioDrawMode = "live";
         updateAudioButtonState(true);
@@ -1184,29 +1191,31 @@ function startAudioSocket() {
         if (statusLabel) statusLabel.innerText = "Status: Live";
         pushAudioLog("Live audio stream connected", "Normal");
 
-        try { audioSocket.send("start"); } catch (e) { }
+        try { audioSocket.send("start"); } catch (e) {}
     };
 
     audioSocket.onmessage = (event) => {
         if (event.data) playRawAudioBuffer(event.data);
     };
 
-    audioSocket.onerror = () => {
+    audioSocket.onerror = (err) => {
         clearTimeout(connectTimer);
         audioDrawMode = "error";
         if (statusLabel) statusLabel.innerText = "Status: WS error";
         updateAudioCardStatus("Error", "#ff4757");
+        console.error("Audio WS error:", err);
         pushAudioLog("Live audio stream error", "Warning");
     };
 
-    audioSocket.onclose = () => {
+    audioSocket.onclose = (event) => {
         clearTimeout(connectTimer);
         isListening = false;
         audioSocket = null;
         audioDrawMode = "waiting";
         updateAudioButtonState(false);
         updateAudioCardStatus(prettyAudioClass(latestAudioClass), getAudioColor(latestAudioClass));
-        if (statusLabel) statusLabel.innerText = "Status: Ready";
+        if (statusLabel) statusLabel.innerText = `Status: Closed (${event.code})`;
+        console.warn("Audio WS closed:", event.code, event.reason);
         pushAudioLog("Live audio stream disconnected", "Normal");
     };
 }
