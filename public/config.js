@@ -1,3 +1,3 @@
 window.BEEROI_CONFIG = {
-  PROXY_BASE_URL: "https://beeroi-web.onrender.com/"
+  PROXY_BASE_URL: "https://beeroi-web.onrender.com"
 };
