@@ -1223,68 +1223,58 @@ function _scheduleWsRetry() {
 }
 
 function startAudioSocket() {
-  if (audioSocket && (audioSocket.readyState === WebSocket.OPEN || audioSocket.readyState === WebSocket.CONNECTING)) return;
-
-  const statusLabel = document.getElementById("audio-level-label");
-
-  audioSocket = new WebSocket(RPI_AUDIO_WS_URL);
-  audioSocket.binaryType = "arraybuffer";
-
-  const connectTimeoutMs = 15000;
-  const connectTimer = setTimeout(() => {
-    if (audioSocket && audioSocket.readyState !== WebSocket.OPEN) {
-      if (statusLabel) statusLabel.innerText = "Status: WS timeout";
-      try {
-        audioSocket.close();
-      } catch (e) {}
+    // 1. Huwag mag-connect kung meron nang existing connection
+    if (audioSocket && (audioSocket.readyState === WebSocket.OPEN || audioSocket.readyState === WebSocket.CONNECTING)) {
+        return;
     }
-  }, connectTimeoutMs);
 
-  audioSocket.onopen = () => {
-    clearTimeout(connectTimer);
-    _wsRetryCount = 0;
+    const statusLabel = document.getElementById("audio-level-label");
+    if (statusLabel) statusLabel.innerText = "Status: Connecting...";
 
-    _ensureAudioRing();
+    // 2. Siguraduhin na ang URL ay tama (wss para sa Render)
+    audioSocket = new WebSocket(RPI_AUDIO_WS_URL);
+    audioSocket.binaryType = "arraybuffer";
 
-    isListening = true;
-    audioDrawMode = "live";
-    updateAudioButtonState(true);
-    updateAudioCardStatus("Live", "#2ecc71");
+    // 3. Timeout Guard (Dahil mabagal ang Render magising)
+    const connectTimer = setTimeout(() => {
+        if (audioSocket && audioSocket.readyState !== WebSocket.OPEN) {
+            console.warn("WS Connection Timeout - Closing and Retrying...");
+            audioSocket.close();
+        }
+    }, 15000); // Bigyan natin ng 15 seconds ang Render
 
-    if (statusLabel) statusLabel.innerText = "Status: Live";
-    pushAudioLog("Live audio stream connected", "Normal");
+    audioSocket.onopen = () => {
+        clearTimeout(connectTimer);
+        _wsRetryCount = 0; // Reset retry counter
+        isListening = true;
+        updateAudioButtonState(true);
+        if (statusLabel) statusLabel.innerText = "Status: Live";
+        console.log("WebSocket Connected!");
+        audioSocket.send("start");
+    };
 
-    try {
-      audioSocket.send("start");
-    } catch (e) {}
-  };
+    audioSocket.onmessage = (event) => {
+        if (event.data) playRawAudioBuffer(event.data);
+    };
 
-  audioSocket.onmessage = (event) => {
-    if (event.data) playRawAudioBuffer(event.data);
-  };
+    audioSocket.onclose = () => {
+        clearTimeout(connectTimer);
+        // 4. AUTO-RETRY LOGIC: Kung hindi intentional ang pag-close, subukan ulit.
+        if (isListening) { 
+            console.log("WS Closed. Retrying in 3 seconds...");
+            if (statusLabel) statusLabel.innerText = "Status: Retrying...";
+            
+            // Iwasan ang spamming, mag-retry lang bawat 3-5 seconds
+            clearTimeout(_wsRetryTimer);
+            _wsRetryTimer = setTimeout(() => {
+                startAudioSocket();
+            }, 3000); 
+        }
+    };
 
-  audioSocket.onerror = () => {
-    clearTimeout(connectTimer);
-    audioDrawMode = "error";
-    if (statusLabel) statusLabel.innerText = "Status: WS error";
-    updateAudioCardStatus("Error", "#ff4757");
-    pushAudioLog("Live audio stream error", "Warning");
-  };
-
-  audioSocket.onclose = () => {
-    clearTimeout(connectTimer);
-    const diedDuringConnect = !isListening;
-
-    isListening = false;
-    audioSocket = null;
-    audioDrawMode = "waiting";
-    updateAudioButtonState(false);
-    updateAudioCardStatus(prettyAudioClass(latestAudioClass), getAudioColor(latestAudioClass));
-    if (statusLabel) statusLabel.innerText = "Status: Ready";
-    pushAudioLog("Live audio stream disconnected", "Normal");
-
-    if (diedDuringConnect) _scheduleWsRetry();
-  };
+    audioSocket.onerror = (err) => {
+        console.error("WebSocket Error:", err);
+    };
 }
 
 function playRawAudioBuffer(data) {
