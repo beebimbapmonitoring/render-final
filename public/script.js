@@ -8,18 +8,23 @@ const CONFIG = {
     weight: 14.5,
 };
 
-const FUNNEL_ORIGIN =
-  (window.__HIVE_FUNNEL_ORIGIN && String(window.__HIVE_FUNNEL_ORIGIN).trim()) ||
-  (localStorage.getItem("hive_funnel_origin") || "").trim();
+// 1. Siguraduhin na malinis ang Funnel Origin (walang slash sa dulo)
+const cleanFunnel = (typeof FUNNEL_ORIGIN !== 'undefined' && FUNNEL_ORIGIN) 
+    ? FUNNEL_ORIGIN.trim().rstrip("/") 
+    : "";
 
-const HTTP_ORIGIN = FUNNEL_ORIGIN || window.location.origin;
-const WS_ORIGIN = FUNNEL_ORIGIN
-  ? FUNNEL_ORIGIN.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://")
-  : ((window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host);
+// 2. Pumili sa pagitan ng Funnel o Current Host
+const HTTP_ORIGIN = cleanFunnel || window.location.origin;
 
+// 3. Ayusin ang WS_ORIGIN base sa napiling HTTP_ORIGIN
+const WS_ORIGIN = HTTP_ORIGIN.replace(/^http/, "ws"); 
+
+// 4. Construct Final URLs (Siguraduhin na walang double slashes)
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
 const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
+
+console.log("Using API URL:", RPI_URL); // I-check mo ito sa console kung tama
 
 const HIVE_TARE_WEIGHT = 2.0;
 
