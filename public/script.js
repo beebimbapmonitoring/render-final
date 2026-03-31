@@ -24,7 +24,13 @@ const WS_ORIGIN = (CONFIG_BASE || window.location.origin)
   : (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host;
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
+
+// Kept for backward compatibility / fallback (not used by default now)
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
+
+// NEW: HTTP audio stream endpoint (FastAPI)
+const RPI_AUDIO_HTTP_URL = `${HTTP_ORIGIN}/audio/stream`;
+
 const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
 
 const HIVE_TARE_WEIGHT = 2.0;
@@ -75,7 +81,11 @@ let currentTemp = 0,
   currentWeight = 0;
 
 let audioContext = null;
+
+// Kept variable for compatibility (WS no longer used by default)
 let audioSocket = null;
+
+// Removed WS ping usage; kept variable to avoid breaking anything
 let audioPingInterval = null;
 
 let isListening = false;
@@ -84,7 +94,11 @@ let audioNextPlayTime = 0;
 let audioWaveData = null;
 let audioDrawMode = "waiting";
 
-// Auto-reconnect (revised)
+// HTTP streaming state (NEW)
+let audioFetchController = null;
+let audioFetchRunning = false;
+
+// Auto-reconnect (HTTP)
 let audioStopRequested = false;
 let audioReconnectTimer = null;
 let audioReconnectAttempts = 0;
@@ -354,26 +368,9 @@ function normalizeAudioClass(value) {
 function normalizeCameraClass(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (raw === "human" || raw === "person" || raw === "hand") return "person";
-  if (
-    raw === "vertebrate" ||
-    raw === "animal" ||
-    raw === "lizard" ||
-    raw === "frog" ||
-    raw === "bird" ||
-    raw === "gecko" ||
-    raw === "rodent"
-  )
+  if (raw === "vertebrate" || raw === "animal" || raw === "lizard" || raw === "frog" || raw === "bird" || raw === "gecko" || raw === "rodent")
     return "vertebrate";
-  if (
-    raw === "other_insect" ||
-    raw === "other insect" ||
-    raw === "insect" ||
-    raw === "ant" ||
-    raw === "wasp" ||
-    raw === "fly" ||
-    raw === "beetle" ||
-    raw === "moth"
-  )
+  if (raw === "other_insect" || raw === "other insect" || raw === "insect" || raw === "ant" || raw === "wasp" || raw === "fly" || raw === "beetle" || raw === "moth")
     return "other_insect";
   if (raw === "tb_cluster") return "tb_cluster";
   if (raw === "t_biroi" || raw === "tetragonula biroi") return "t_biroi";
@@ -918,7 +915,8 @@ async function updateData() {
       logEvent = "Env: High Temp";
     }
 
-    const statusClass = logStatus === "Normal" ? "badge-normal" : logStatus === "Logged" ? "badge-logonly" : "badge-warning";
+    const statusClass =
+      logStatus === "Normal" ? "badge-normal" : logStatus === "Logged" ? "badge-logonly" : "badge-warning";
 
     const tbody = document.querySelector("#logs-table tbody");
 
@@ -1212,7 +1210,12 @@ function closeVideoModal() {
   stopAudio();
 }
 
-// Revised: desire-based toggle
+/**
+ * AUDIO CONTROL (HTTP stream)
+ * - Keeps toggleAudio/startAudioSocket names for compatibility
+ * - Internally uses fetch stream: GET /audio/stream
+ */
+
 async function toggleAudio() {
   const statusLabel = document.getElementById("audio-level-label");
 
@@ -1228,7 +1231,7 @@ async function toggleAudio() {
       }
 
       await ensureAudioContextRunning();
-      startAudioSocket();
+      startAudioSocket(); // now HTTP streaming
       if (statusLabel) statusLabel.innerText = "Status: Connecting...";
     } else {
       stopAudio();
@@ -1241,7 +1244,6 @@ async function toggleAudio() {
   }
 }
 
-// Revised: smarter reconnect scheduling
 function _scheduleAudioReconnect(reason = "") {
   if (!audioDesired) return;
   if (audioStopRequested) return;
@@ -1270,35 +1272,52 @@ function _scheduleAudioReconnect(reason = "") {
     if (!navigator.onLine || document.hidden) return;
 
     try {
-      startAudioSocket();
+      startAudioSocket(); // retry HTTP stream
     } catch (e) {
       _scheduleAudioReconnect("retry failed");
     }
   }, delay);
 }
 
+// Kept name: startAudioSocket(), now uses HTTP stream
 function startAudioSocket() {
-  if (audioSocket && (audioSocket.readyState === WebSocket.OPEN || audioSocket.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
+  startAudioHttpStream();
+}
+
+// NEW: HTTP streaming implementation
+async function startAudioHttpStream() {
+  if (audioFetchRunning) return;
 
   const statusLabel = document.getElementById("audio-level-label");
 
-  audioSocket = new WebSocket(RPI_AUDIO_WS_URL);
-  audioSocket.binaryType = "arraybuffer";
+  audioFetchRunning = true;
 
-  const connectTimeoutMs = 6000;
-  const connectTimer = setTimeout(() => {
-    if (audioSocket && audioSocket.readyState !== WebSocket.OPEN && audioSocket.readyState !== WebSocket.CLOSED) {
-      if (statusLabel) statusLabel.innerText = "Status: WS timeout";
-      try {
-        audioSocket.close();
-      } catch (e) {}
+  if (audioFetchController) {
+    try {
+      audioFetchController.abort();
+    } catch (e) {}
+  }
+  audioFetchController = new AbortController();
+
+  _ensureAudioRing();
+  isListening = true;
+  audioDrawMode = "live";
+  updateAudioButtonState(true);
+  updateAudioCardStatus("Live", "#2ecc71");
+
+  if (statusLabel) statusLabel.innerText = "Status: Live";
+  pushAudioLog("Live audio (HTTP) connecting", "Normal");
+
+  try {
+    const resp = await fetch(RPI_AUDIO_HTTP_URL, {
+      method: "GET",
+      cache: "no-store",
+      signal: audioFetchController.signal,
+    });
+
+    if (!resp.ok || !resp.body) {
+      throw new Error(`HTTP audio failed: ${resp.status}`);
     }
-  }, connectTimeoutMs);
-
-  audioSocket.onopen = () => {
-    clearTimeout(connectTimer);
 
     audioReconnectAttempts = 0;
     if (audioReconnectTimer) {
@@ -1306,66 +1325,37 @@ function startAudioSocket() {
       audioReconnectTimer = null;
     }
 
-    _ensureAudioRing();
-    isListening = true;
-    audioDrawMode = "live";
-    updateAudioButtonState(true);
-    updateAudioCardStatus("Live", "#2ecc71");
+    pushAudioLog("Live audio (HTTP) connected", "Normal");
 
-    if (statusLabel) statusLabel.innerText = "Status: Live";
-    pushAudioLog("Live audio stream connected", "Normal");
+    const reader = resp.body.getReader();
 
-    try {
-      audioSocket.send("start");
-    } catch (e) {}
+    while (audioDesired && !audioStopRequested) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value || !value.byteLength) continue;
 
-    if (audioPingInterval) clearInterval(audioPingInterval);
-    audioPingInterval = setInterval(() => {
-      if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
-        try {
-          audioSocket.send("ping");
-        } catch (e) {}
-      }
-    }, 15000);
-  };
-
-  audioSocket.onmessage = (event) => {
-    if (typeof event.data === "string") {
-      if (event.data === "pong") return;
-      return;
-    }
-    if (event.data) playRawAudioBuffer(event.data);
-  };
-
-  audioSocket.onerror = (err) => {
-    clearTimeout(connectTimer);
-    audioDrawMode = "error";
-    if (statusLabel) statusLabel.innerText = "Status: WS error";
-    updateAudioCardStatus("Error", "#ff4757");
-    console.error("Audio WS error:", err);
-    pushAudioLog("Live audio stream error", "Warning");
-  };
-
-  audioSocket.onclose = (event) => {
-    clearTimeout(connectTimer);
-
-    if (audioPingInterval) {
-      clearInterval(audioPingInterval);
-      audioPingInterval = null;
+      const ab = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      playRawAudioBuffer(ab);
     }
 
-    isListening = false;
-    audioSocket = null;
-    audioDrawMode = "waiting";
-    updateAudioButtonState(false);
-    updateAudioCardStatus(prettyAudioClass(latestAudioClass), getAudioColor(latestAudioClass));
-
-    if (statusLabel) statusLabel.innerText = `Status: Closed (${event.code})`;
-    console.warn("Audio WS closed:", event.code, event.reason);
-    pushAudioLog("Live audio stream disconnected", "Normal");
-
-    if (audioDesired && !audioStopRequested) _scheduleAudioReconnect(`code ${event.code || "?"}`);
-  };
+    // Stream ended (server closed or network)
+    if (audioDesired && !audioStopRequested) {
+      pushAudioLog("Live audio (HTTP) ended", "Warning");
+      _scheduleAudioReconnect("stream ended");
+    }
+  } catch (err) {
+    if (!audioStopRequested) {
+      console.warn("HTTP audio stream error:", err);
+      pushAudioLog("Live audio (HTTP) error", "Warning");
+      audioDrawMode = "error";
+      updateAudioCardStatus("Error", "#ff4757");
+      if (statusLabel) statusLabel.innerText = "Status: HTTP error";
+      _scheduleAudioReconnect("http error");
+    }
+  } finally {
+    audioFetchRunning = false;
+    if (!audioDesired) isListening = false;
+  }
 }
 
 function playRawAudioBuffer(data) {
@@ -1428,11 +1418,20 @@ function stopAudio() {
   }
   audioReconnectAttempts = 0;
 
+  // Abort HTTP stream
+  if (audioFetchController) {
+    try {
+      audioFetchController.abort();
+    } catch (e) {}
+    audioFetchController = null;
+  }
+  audioFetchRunning = false;
+
+  // Cleanup legacy WS if ever used
   if (audioPingInterval) {
     clearInterval(audioPingInterval);
     audioPingInterval = null;
   }
-
   if (audioSocket) {
     try {
       audioSocket.onopen = null;
@@ -1542,6 +1541,10 @@ function populateAudioLogs() {
     container.appendChild(div);
   });
 }
+
+// --- everything below remains same as your original file ---
+// animateSpectrogram(), alerts, links, DOMContentLoaded, profile/log deletes
+// (unchanged from your uploaded script)
 
 function animateSpectrogram(canvas) {
   if (!canvas || !canvas.parentElement) return;
