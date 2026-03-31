@@ -76,17 +76,19 @@ let currentTemp = 0,
 
 let audioContext = null;
 let audioSocket = null;
-let audioPingInterval = null; // <-- merged: keepalive ping interval
+let audioPingInterval = null;
+
 let isListening = false;
 let audioMasterGain = null;
 let audioNextPlayTime = 0;
 let audioWaveData = null;
 let audioDrawMode = "waiting";
 
-// Auto-reconnect (added)
+// Auto-reconnect (revised)
 let audioStopRequested = false;
 let audioReconnectTimer = null;
 let audioReconnectAttempts = 0;
+let audioDesired = false;
 
 let latestAudioClass = "normal";
 let latestAudioConf = 0;
@@ -352,9 +354,26 @@ function normalizeAudioClass(value) {
 function normalizeCameraClass(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (raw === "human" || raw === "person" || raw === "hand") return "person";
-  if (raw === "vertebrate" || raw === "animal" || raw === "lizard" || raw === "frog" || raw === "bird" || raw === "gecko" || raw === "rodent")
+  if (
+    raw === "vertebrate" ||
+    raw === "animal" ||
+    raw === "lizard" ||
+    raw === "frog" ||
+    raw === "bird" ||
+    raw === "gecko" ||
+    raw === "rodent"
+  )
     return "vertebrate";
-  if (raw === "other_insect" || raw === "other insect" || raw === "insect" || raw === "ant" || raw === "wasp" || raw === "fly" || raw === "beetle" || raw === "moth")
+  if (
+    raw === "other_insect" ||
+    raw === "other insect" ||
+    raw === "insect" ||
+    raw === "ant" ||
+    raw === "wasp" ||
+    raw === "fly" ||
+    raw === "beetle" ||
+    raw === "moth"
+  )
     return "other_insect";
   if (raw === "tb_cluster") return "tb_cluster";
   if (raw === "t_biroi" || raw === "tetragonula biroi") return "t_biroi";
@@ -759,7 +778,8 @@ async function updateData() {
     latestLastAudioTs = lastAudioTs;
     latestLastVideoTs = lastVideoTs;
   } catch (error) {
-    console.error("Connection Failed:", error);
+    const isAbort = error && (error.name === "AbortError" || String(error).includes("AbortError"));
+    if (!isAbort) console.error("Connection Failed:", error);
     isOffline = true;
     t = "--";
     h = "--";
@@ -1192,13 +1212,16 @@ function closeVideoModal() {
   stopAudio();
 }
 
+// Revised: desire-based toggle
 async function toggleAudio() {
   const statusLabel = document.getElementById("audio-level-label");
 
   try {
-    if (!isListening) {
+    if (!audioDesired) {
+      audioDesired = true;
       audioStopRequested = false;
       audioReconnectAttempts = 0;
+
       if (audioReconnectTimer) {
         clearTimeout(audioReconnectTimer);
         audioReconnectTimer = null;
@@ -1211,45 +1234,51 @@ async function toggleAudio() {
       stopAudio();
     }
   } catch (err) {
+    audioDesired = false;
     if (statusLabel) statusLabel.innerText = "Status: Unable to start";
     pushAudioLog("Live audio failed to start", "Warning");
     alert("Please interact with the page first to enable live audio.");
   }
 }
 
-// Auto-reconnect scheduling helper (added)
-function _scheduleAudioReconnect() {
+// Revised: smarter reconnect scheduling
+function _scheduleAudioReconnect(reason = "") {
+  if (!audioDesired) return;
   if (audioStopRequested) return;
+  if (!navigator.onLine) return;
+  if (document.hidden) return;
   if (audioReconnectTimer) return;
 
   const statusLabel = document.getElementById("audio-level-label");
 
   const attempt = Math.max(0, audioReconnectAttempts);
-  const base = Math.min(30000, 1000 * Math.pow(2, Math.min(attempt, 5))); // 1s,2s,4s,8s,16s,32s->cap 30s
-  const jitter = Math.floor(Math.random() * 500);
+  const base = Math.min(60000, 2000 * Math.pow(2, Math.min(attempt, 6)));
+  const jitter = Math.floor(Math.random() * 800);
   const delay = base + jitter;
 
   audioReconnectAttempts += 1;
 
-  if (statusLabel) statusLabel.innerText = `Status: Reconnecting in ${Math.ceil(delay / 1000)}s...`;
+  if (statusLabel) {
+    const why = reason ? ` • ${reason}` : "";
+    statusLabel.innerText = `Status: Reconnecting in ${Math.ceil(delay / 1000)}s${why}`;
+  }
 
   audioReconnectTimer = setTimeout(() => {
     audioReconnectTimer = null;
-    if (audioStopRequested) return;
+
+    if (!audioDesired || audioStopRequested) return;
+    if (!navigator.onLine || document.hidden) return;
 
     try {
       startAudioSocket();
     } catch (e) {
-      _scheduleAudioReconnect();
+      _scheduleAudioReconnect("retry failed");
     }
   }, delay);
 }
 
 function startAudioSocket() {
-  if (
-    audioSocket &&
-    (audioSocket.readyState === WebSocket.OPEN || audioSocket.readyState === WebSocket.CONNECTING)
-  ) {
+  if (audioSocket && (audioSocket.readyState === WebSocket.OPEN || audioSocket.readyState === WebSocket.CONNECTING)) {
     return;
   }
 
@@ -1335,7 +1364,7 @@ function startAudioSocket() {
     console.warn("Audio WS closed:", event.code, event.reason);
     pushAudioLog("Live audio stream disconnected", "Normal");
 
-    if (!audioStopRequested) _scheduleAudioReconnect();
+    if (audioDesired && !audioStopRequested) _scheduleAudioReconnect(`code ${event.code || "?"}`);
   };
 }
 
@@ -1390,6 +1419,7 @@ function playRawAudioBuffer(data) {
 }
 
 function stopAudio() {
+  audioDesired = false;
   audioStopRequested = true;
 
   if (audioReconnectTimer) {
