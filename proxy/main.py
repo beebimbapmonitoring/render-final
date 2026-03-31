@@ -1,16 +1,22 @@
+# proxy/main.py
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from typing import AsyncIterator
+from datetime import datetime
+from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
 
 import httpx
 import websockets
-from fastapi import FastAPI, Request, Response, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, desc
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 logging.basicConfig(level=logging.INFO)
@@ -19,10 +25,64 @@ logger = logging.getLogger("render-proxy")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 DEFAULT_PI_HTTP_BASE = os.getenv("PI_HTTP_BASE", "").strip().rstrip("/")
 PI_API_TOKEN = os.getenv("PI_API_TOKEN", "").strip()
+RPI_EVENT_TOKEN = os.getenv("RPI_EVENT_TOKEN", "").strip()
+DB_URL = os.getenv("DB_URL", "").strip()
 
 PI_HTTP_BASE_RUNTIME = DEFAULT_PI_HTTP_BASE
 
-app = FastAPI()
+app = FastAPI(title="Hive Render Proxy")
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class EventLog(Base):
+    __tablename__ = "event_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="rpi")
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)  # audio|video
+    event: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # intruded|stress_buzz|swarming
+    conf: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, default=datetime.utcnow, index=True)
+
+
+class EventIn(BaseModel):
+    device_id: str = Field(default="rpi", max_length=64)
+    kind: str = Field(..., max_length=16)
+    event: str = Field(..., max_length=64)
+    conf: float = 0.0
+    payload: Optional[dict] = None
+
+
+_ENGINE = None
+SessionLocal = None
+
+
+def _init_db() -> None:
+    global _ENGINE, SessionLocal
+
+    if not DB_URL:
+        logger.warning("DB_URL not configured. Event logging endpoints will not work.")
+        return
+
+    _ENGINE = create_engine(DB_URL, pool_pre_ping=True)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_ENGINE)
+    Base.metadata.create_all(bind=_ENGINE)
+    logger.info("Database initialized.")
+
+
+def _require_db() -> None:
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail="Database is not configured. Set DB_URL on Render.")
+
+
+def _db_session() -> Session:
+    _require_db()
+    return SessionLocal()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +90,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    _init_db()
 
 
 @app.middleware("http")
@@ -44,7 +109,7 @@ async def always_cors(request: Request, call_next):
     resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-token, Authorization"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-token, x-rpi-token, Authorization"
     return resp
 
 
@@ -83,21 +148,40 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {PI_API_TOKEN}"}
 
 
+def _require_rpi_event_token(x_rpi_token: str | None) -> None:
+    if not RPI_EVENT_TOKEN:
+        return
+    if x_rpi_token != RPI_EVENT_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @app.get("/health")
 async def health() -> dict:
+    db_ok = False
+    if SessionLocal is not None:
+        try:
+            db = _db_session()
+            try:
+                db.execute(EventLog.__table__.select().limit(1))
+                db_ok = True
+            finally:
+                db.close()
+        except Exception:
+            db_ok = False
+
     return {
         "ok": True,
         "pi_http_base": PI_HTTP_BASE_RUNTIME or None,
         "has_admin_token": bool(ADMIN_TOKEN),
         "has_pi_api_token": bool(PI_API_TOKEN),
+        "has_rpi_event_token": bool(RPI_EVENT_TOKEN),
+        "has_db_url": bool(DB_URL),
+        "db_ok": db_ok,
     }
 
 
 @app.get("/debug/upstream")
 async def debug_upstream() -> dict:
-    """
-    Quick Render-side test to verify that the Pi HTTP endpoint is reachable.
-    """
     base = _pi_http_base()
     url = f"{base}/api/latest"
     try:
@@ -210,10 +294,6 @@ async def _safe_close_ws(ws: WebSocket, code: int = 1011, reason: str = "") -> N
 
 
 def _websocket_connect_kwargs(headers: dict[str, str]) -> dict:
-    """
-    Compatibility helper for different websockets versions.
-    Some versions use extra_headers, others use additional_headers.
-    """
     kwargs = {
         "ping_interval": 20,
         "ping_timeout": 20,
@@ -309,3 +389,78 @@ async def ws_audio(ws: WebSocket) -> None:
 @app.websocket("/ws/sensors")
 async def ws_sensors(ws: WebSocket) -> None:
     await _ws_passthrough(ws, "/ws/sensors")
+
+
+@app.post("/api/events")
+async def api_events(payload: EventIn, request: Request):
+    _require_db()
+    _require_rpi_event_token(request.headers.get("x-rpi-token"))
+
+    allowed_events = {"intruded", "stress_buzz", "swarming"}
+    allowed_kinds = {"audio", "video"}
+
+    event = payload.event.strip().lower()
+    kind = payload.kind.strip().lower()
+
+    if event not in allowed_events:
+        raise HTTPException(status_code=400, detail="Unsupported event")
+    if kind not in allowed_kinds:
+        raise HTTPException(status_code=400, detail="Unsupported kind")
+
+    db = _db_session()
+    try:
+        row = EventLog(
+            device_id=payload.device_id.strip() or "rpi",
+            kind=kind,
+            event=event,
+            conf=float(payload.conf or 0.0),
+            payload_json=json.dumps(payload.payload) if payload.payload is not None else None,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {"ok": True, "id": row.id}
+    except Exception as e:
+        db.rollback()
+        logger.exception("Failed to insert event")
+        raise HTTPException(status_code=500, detail=f"Failed to insert event: {type(e).__name__}")
+    finally:
+        db.close()
+
+
+@app.get("/api/events")
+async def list_events(
+    limit: int = Query(default=50, ge=1, le=500),
+    kind: Optional[str] = Query(default=None),
+    event: Optional[str] = Query(default=None),
+):
+    _require_db()
+
+    db = _db_session()
+    try:
+        q = db.query(EventLog)
+
+        if kind:
+            q = q.filter(EventLog.kind == kind.strip().lower())
+        if event:
+            q = q.filter(EventLog.event == event.strip().lower())
+
+        rows = q.order_by(desc(EventLog.created_at), desc(EventLog.id)).limit(limit).all()
+
+        return {
+            "ok": True,
+            "items": [
+                {
+                    "id": r.id,
+                    "device_id": r.device_id,
+                    "kind": r.kind,
+                    "event": r.event,
+                    "conf": r.conf,
+                    "payload": json.loads(r.payload_json) if r.payload_json else None,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ],
+        }
+    finally:
+        db.close()
