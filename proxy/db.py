@@ -6,7 +6,7 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-DB_URL = os.getenv("DB_URL", os.getenv("DATABASE_URL", "")).strip()
+DB_URL = os.getenv("DB_URL", os.getenv("DATABASE_URL", "postgresql://beeroi_db_user:nz1qcDRh6oc4JzoFbccaEoMZCJMp6eW7@dpg-d7748jnafjfc73e7alvg-a/beeroi_db")).strip()
 
 if not DB_URL:
     raise RuntimeError("DB_URL or DATABASE_URL is not set")
