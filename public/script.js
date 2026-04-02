@@ -1,7 +1,7 @@
 let socket;
 
 const CONFIG = {
-  temp: { min: 28.0, max: 33.0 },
+  temp: { min: 28.0, max: 32.0 },
   hum: { min: 55, max: 65 },
   weight: 14.5,
 };
