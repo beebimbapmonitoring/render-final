@@ -7,7 +7,7 @@ from typing import Optional
 from sqlalchemy import DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .db import Base
+from db import Base
 
 
 class EventLog(Base):
