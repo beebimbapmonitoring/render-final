@@ -9,8 +9,6 @@ const CONFIG = {
 const CONFIG_BASE =
   (window.BEEROI_CONFIG && String(window.BEEROI_CONFIG.PROXY_BASE_URL || "").trim()) || "";
 
-// If you deploy to Render, you usually want CONFIG_BASE="" so it uses window.location.origin.
-// Keep FUNNEL_ORIGIN as fallback only (dev/local).
 const FUNNEL_ORIGIN =
   (window.__HIVE_FUNNEL_ORIGIN && String(window.__HIVE_FUNNEL_ORIGIN).trim()) ||
   (localStorage.getItem("hive_funnel_origin") || "").trim();
@@ -19,19 +17,19 @@ const HTTP_ORIGIN = CONFIG_BASE || window.location.origin || FUNNEL_ORIGIN;
 
 const WS_ORIGIN = (CONFIG_BASE || window.location.origin)
   ? String(CONFIG_BASE || window.location.origin)
-      .replace(/^https:\/\//, "wss://")
-      .replace(/^http:\/\//, "ws://")
+    .replace(/^https:\/\//, "wss://")
+    .replace(/^http:\/\//, "ws://")
   : (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host;
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
-
-// Kept for backward compatibility / fallback (not used by default now)
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
-
-// NEW: HTTP audio stream endpoint (FastAPI)
 const RPI_AUDIO_HTTP_URL = `${HTTP_ORIGIN}/audio/stream`;
-
+const RPI_AUDIO_HTTP_API_URL = `${HTTP_ORIGIN}/api/audio/stream`;
 const RPI_VIDEO_URL = `${HTTP_ORIGIN}/video.mjpg`;
+const RPI_VIDEO_OPEN_URL = `${HTTP_ORIGIN}/api/video/open`;
+const RPI_VIDEO_CLOSE_URL = `${HTTP_ORIGIN}/api/video/close`;
+const RPI_ALERT_ACK_URL = `${HTTP_ORIGIN}/api/alert/ack`;
+const RPI_ALERT_RESET_URL = `${HTTP_ORIGIN}/api/alert/reset`;
 
 const HIVE_TARE_WEIGHT = 2.0;
 
@@ -48,57 +46,90 @@ const AUDIO_VIZ = {
   showGrid: true,
 };
 
-function _readAudioVizFromUI() {
-  const zy = document.getElementById("audio-zoom-y");
-  const zx = document.getElementById("audio-zoom-x");
-
-  if (zy) {
-    const v = Number(zy.value);
-    if (!Number.isNaN(v) && v > 0) AUDIO_VIZ.zoomY = v;
-  }
-  if (zx) {
-    const v = Number(zx.value);
-    if (!Number.isNaN(v) && v > 0) AUDIO_VIZ.zoomX = v;
+function _safeJsonParse(value, fallback = null) {
+  try {
+    if (value == null || value === "") return fallback;
+    return JSON.parse(value);
+  } catch {
+    return fallback;
   }
 }
 
-let SETTINGS = { refreshRate: 2000, sensitivity: 8, audioEnabled: true };
-let hiveChart, detailedChart, updateIntervalId, alarmInterval = null;
-let activeOscillators = [],
-  specAnimationId = null;
+function getApiToken() {
+  const token =
+    (window.BEEROI_CONFIG && String(window.BEEROI_CONFIG.PI_API_TOKEN || "").trim()) ||
+    (window.__HIVE_PI_API_TOKEN && String(window.__HIVE_PI_API_TOKEN).trim()) ||
+    (localStorage.getItem("hive_pi_api_token") || "").trim();
+  return token || "";
+}
 
-let tempHistory = [],
-  humHistory = [],
-  weightHistory = [],
-  timeLabels = [];
-let allLogs = [],
-  audioLogs = [],
-  videoLogs = [];
-const MAX_HISTORY = 20;
+function buildAuthHeaders(extra = {}) {
+  const headers = { ...extra };
+  const token = getApiToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
 
-let currentTemp = 0,
-  currentHum = 0,
-  currentWeight = 0;
+async function apiFetch(url, options = {}) {
+  const mergedHeaders = buildAuthHeaders(options.headers || {});
+  return fetch(url, { ...options, headers: mergedHeaders });
+}
+
+async function apiPost(url, body) {
+  const options = {
+    method: "POST",
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  };
+  return apiFetch(url, options);
+}
+
+let SETTINGS = {
+  refreshRate: 2000,
+  sensitivity: 8,
+  audioEnabled: true,
+  chartHistory: 20,
+  autoOpenVideoOnAlert: true,
+  audioZoomX: 1.0,
+  audioZoomY: 1.25,
+  audioShowAxes: true,
+  audioShowGrid: true,
+  use24h: true,
+};
+
+let hiveChart;
+let detailedChart;
+let updateIntervalId;
+let alarmInterval = null;
+let specAnimationId = null;
+let activeOscillators = [];
+
+let tempHistory = [];
+let humHistory = [];
+let weightHistory = [];
+let timeLabels = [];
+let allLogs = [];
+let audioLogs = [];
+let videoLogs = [];
+let MAX_HISTORY = 20;
+
+let currentTemp = 0;
+let currentHum = 0;
+let currentWeight = 0;
 
 let audioContext = null;
-
-// Kept variable for compatibility (WS no longer used by default)
 let audioSocket = null;
-
-// Removed WS ping usage; kept variable to avoid breaking anything
 let audioPingInterval = null;
-
 let isListening = false;
 let audioMasterGain = null;
 let audioNextPlayTime = 0;
 let audioWaveData = null;
 let audioDrawMode = "waiting";
 
-// HTTP streaming state (NEW)
 let audioFetchController = null;
 let audioFetchRunning = false;
-
-// Auto-reconnect (HTTP)
+let audioReader = null;
+let activeAudioStreamUrl = null;
 let audioStopRequested = false;
 let audioReconnectTimer = null;
 let audioReconnectAttempts = 0;
@@ -107,7 +138,7 @@ let audioDesired = false;
 let latestAudioClass = "normal";
 let latestAudioConf = 0;
 let latestAudioScores = [];
-let latestCameraClass = "bee";
+let latestCameraClass = "idle";
 let latestCameraConf = 0;
 let latestCameraDetections = [];
 let latestColonyState = "normal_activity";
@@ -118,9 +149,23 @@ let latestCameraLogOnly = false;
 let latestLastAudioTs = 0;
 let latestLastVideoTs = 0;
 
+let backendAlertActive = false;
+let backendAlertAcknowledged = false;
+let backendAlertLatched = false;
+let backendAlertSource = null;
+let backendTriggerAudioClass = null;
+let backendTriggeredAt = 0;
+let backendManualVideoActive = false;
+let backendAudioVideoTriggerActive = false;
+let backendAudioVideoTriggerClass = null;
+let backendAudioVideoTriggeredAt = 0;
+let backendCameraBackend = "--";
+let backendVideoAiAlwaysOn = false;
+
 let isFetchingLatest = false;
 let lastAlertKey = "";
 let alertAcknowledged = false;
+let lastResetUiTs = 0;
 
 const AUDIO_RING_SECONDS = 12;
 let audioRing = null;
@@ -130,6 +175,23 @@ let audioRingFilled = false;
 let WAVE_VIEW_SECONDS = 5.0;
 let WAVE_GAIN = 1.0;
 
+let lastVideoLogKey = "";
+let lastAudioLogKey = "";
+
+const DEFAULT_PROFILE = {
+  name: "Admin",
+  role: "Head Keeper",
+  credentials: "Authorized Personnel",
+  avatar: "https://api.dicebear.com/7.x/avataaars/svg?seed=Felix",
+};
+
+function formatClock(dateObj = new Date(), withSeconds = false) {
+  const options = SETTINGS.use24h
+    ? { hour: "2-digit", minute: "2-digit", ...(withSeconds ? { second: "2-digit" } : {}), hour12: false }
+    : { hour: "2-digit", minute: "2-digit", ...(withSeconds ? { second: "2-digit" } : {}), hour12: true };
+  return dateObj.toLocaleTimeString([], options);
+}
+
 function _ensureAudioRing() {
   const sr = AUDIO_STREAM_FORMAT.sampleRate || 16000;
   const capacity = Math.max(1, Math.floor(sr * AUDIO_RING_SECONDS));
@@ -138,6 +200,13 @@ function _ensureAudioRing() {
     audioRingWrite = 0;
     audioRingFilled = false;
   }
+}
+
+function _clearAudioRing() {
+  _ensureAudioRing();
+  audioRing.fill(0);
+  audioRingWrite = 0;
+  audioRingFilled = false;
 }
 
 function _pushToAudioRing(monoFloat32) {
@@ -153,96 +222,112 @@ function _pushToAudioRing(monoFloat32) {
   }
 }
 
-const DEFAULT_PROFILE = {
-  name: "Admin",
-  role: "Head Keeper",
-  credentials: "Authorized Personnel",
-  avatar: "https://api.dicebear.com/7.x/avataaars/svg?seed=Felix",
-};
-
-const BEE_RESOURCES = {
-  pollinators: {
-    title: "Forest Pollinators",
-    links: [
-      { name: "Wikipedia: Stingless Bee", url: "https://en.wikipedia.org/wiki/Stingless_bee", icon: "fas fa-book" },
-      {
-        name: "Stingless Beekeeping - Filipino Style",
-        url: "https://www.ps.org.au/articles/stingless-beekeeping-filipino-style#:~:text=The%20most%20popular%20and%20commonly,pollinate%20mango%20and%20coconut%20crops",
-        icon: "fas fa-book",
-      },
-      { name: "Tetragonula biroi - Philippines", url: "https://www.nativebeehives.com/tetragonula-biroi-philippines/", icon: "fas fa-book" },
-    ],
-  },
-  honey: {
-    title: "Medicinal Pot Honey",
-    links: [
-      { name: "NCBI Study", url: "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8067784/", icon: "fas fa-microscope" },
-      { name: "Ark of taste", url: "https://www.fondazioneslowfood.com/en/ark-of-taste-slow-food/honey-of-stingless-bee/", icon: "fas fa-microscope" },
-      {
-        name: "Philippine Journal of Science",
-        url: "https://philjournalsci.dost.gov.ph/effect-of-storage-time-on-the-quality-of-stingless-bee-tetragonula-biroi-friese-honey/",
-        icon: "fas fa-microscope",
-      },
-    ],
-  },
-  defense: {
-    title: "Propolis & Defense",
-    links: [
-      { name: "Wikipedia: Propolis", url: "https://en.wikipedia.org/wiki/Propolis", icon: "fas fa-shield-alt" },
-      {
-        name: "Philippine Journal of Science",
-        url: "https://philjournalsci.dost.gov.ph/wp-content/uploads/2025/07/inhibitory_activity_of_propolis_from_Phil_stingless_bees_.pdf",
-        icon: "fas fa-shield-alt",
-      },
-      {
-        name: "ResearchGate",
-        url: "https://www.researchgate.net/publication/376721862_ADAPTIVE_DEFENCE_STRATEGIES_OF_THE_STINGLESS_BEE_TETRAGONULA_IRIDIPENNIS_SMITH_AGAINST_NEST_INTRUDERS_IN_A_NEWLY_DIVIDED_COLONY#:~:text=division%20guard%20bee%20ac%EE%9E%9F,These",
-        icon: "fas fa-shield-alt",
-      },
-    ],
-  },
-};
-
 function loadSettings() {
-  const saved = JSON.parse(localStorage.getItem("hive_settings"));
-  if (saved) SETTINGS = { ...SETTINGS, ...saved };
+  const saved = _safeJsonParse(localStorage.getItem("hive_settings"), null);
+  if (saved && typeof saved === "object") SETTINGS = { ...SETTINGS, ...saved };
 
+  MAX_HISTORY = Number(SETTINGS.chartHistory) || 20;
+
+  const mapping = [
+    ["setting-refresh", SETTINGS.refreshRate],
+    ["setting-sensitivity", SETTINGS.sensitivity],
+    ["setting-history", SETTINGS.chartHistory],
+    ["setting-audio-zoom-x", SETTINGS.audioZoomX],
+    ["setting-audio-zoom-y", SETTINGS.audioZoomY],
+  ];
+
+  mapping.forEach(([id, value]) => {
+    const el = document.getElementById(id);
+    if (el) el.value = value;
+  });
+
+  const checks = [
+    ["setting-audio", SETTINGS.audioEnabled],
+    ["setting-auto-video", SETTINGS.autoOpenVideoOnAlert],
+    ["setting-audio-axes", SETTINGS.audioShowAxes],
+    ["setting-audio-grid", SETTINGS.audioShowGrid],
+    ["setting-24h", SETTINGS.use24h],
+  ];
+
+  checks.forEach(([id, value]) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = !!value;
+  });
+
+  AUDIO_VIZ.zoomX = Number(SETTINGS.audioZoomX) || 1.0;
+  AUDIO_VIZ.zoomY = Number(SETTINGS.audioZoomY) || 1.25;
+  AUDIO_VIZ.showAxes = !!SETTINGS.audioShowAxes;
+  AUDIO_VIZ.showGrid = !!SETTINGS.audioShowGrid;
+}
+
+function applyAudioSettingsToModal() {
+  const zx = document.getElementById("audio-zoom-x");
+  const zy = document.getElementById("audio-zoom-y");
+  const ax = document.getElementById("audio-show-axes");
+  const gr = document.getElementById("audio-show-grid");
+
+  if (zx) zx.value = SETTINGS.audioZoomX;
+  if (zy) zy.value = SETTINGS.audioZoomY;
+  if (ax) ax.checked = SETTINGS.audioShowAxes;
+  if (gr) gr.checked = SETTINGS.audioShowGrid;
+
+  _readAudioVizFromUI();
+  updateAudioParamLabels();
+}
+
+function saveSettings() {
   const refreshEl = document.getElementById("setting-refresh");
-  if (refreshEl) refreshEl.value = SETTINGS.refreshRate;
-
   const audioEl = document.getElementById("setting-audio");
-  if (audioEl) audioEl.checked = SETTINGS.audioEnabled;
-
   const sensitivityEl = document.getElementById("setting-sensitivity");
-  if (sensitivityEl) sensitivityEl.value = SETTINGS.sensitivity;
+  const historyEl = document.getElementById("setting-history");
+  const autoVideoEl = document.getElementById("setting-auto-video");
+  const audioZoomXEl = document.getElementById("setting-audio-zoom-x");
+  const audioZoomYEl = document.getElementById("setting-audio-zoom-y");
+  const audioAxesEl = document.getElementById("setting-audio-axes");
+  const audioGridEl = document.getElementById("setting-audio-grid");
+  const use24hEl = document.getElementById("setting-24h");
+
+  if (refreshEl) SETTINGS.refreshRate = parseInt(refreshEl.value, 10);
+  if (audioEl) SETTINGS.audioEnabled = audioEl.checked;
+  if (sensitivityEl) SETTINGS.sensitivity = parseInt(sensitivityEl.value, 10);
+  if (historyEl) SETTINGS.chartHistory = parseInt(historyEl.value, 10);
+  if (autoVideoEl) SETTINGS.autoOpenVideoOnAlert = autoVideoEl.checked;
+  if (audioZoomXEl) SETTINGS.audioZoomX = parseFloat(audioZoomXEl.value);
+  if (audioZoomYEl) SETTINGS.audioZoomY = parseFloat(audioZoomYEl.value);
+  if (audioAxesEl) SETTINGS.audioShowAxes = audioAxesEl.checked;
+  if (audioGridEl) SETTINGS.audioShowGrid = audioGridEl.checked;
+  if (use24hEl) SETTINGS.use24h = use24hEl.checked;
+
+  MAX_HISTORY = Number(SETTINGS.chartHistory) || 20;
+
+  AUDIO_VIZ.zoomX = SETTINGS.audioZoomX;
+  AUDIO_VIZ.zoomY = SETTINGS.audioZoomY;
+  AUDIO_VIZ.showAxes = SETTINGS.audioShowAxes;
+  AUDIO_VIZ.showGrid = SETTINGS.audioShowGrid;
+
+  localStorage.setItem("hive_settings", JSON.stringify(SETTINGS));
+  applyAudioSettingsToModal();
+  startDataUpdates();
+  updateCamTime();
+  alert("✅ Settings Saved!");
+}
+
+function resetSettings() {
+  localStorage.removeItem("hive_settings");
+  location.reload();
 }
 
 function loadProfile() {
-  const saved = JSON.parse(localStorage.getItem("hive_profile")) || DEFAULT_PROFILE;
-  try {
-    document.getElementById("sidebar-name").innerText = saved.name;
-    document.getElementById("sidebar-role").innerText = saved.role;
-    document.getElementById("sidebar-avatar").src = saved.avatar;
-    document.getElementById("greeting-text").innerText = `Hello, ${saved.name.split(" ")[0]}! 👋`;
-    document.getElementById("nav-mini-avatar").src = saved.avatar;
-
-    const nameInput = document.getElementById("edit-name");
-    if (nameInput) nameInput.value = saved.name;
-
-    const roleInput = document.getElementById("edit-role");
-    if (roleInput) roleInput.value = saved.role;
-
-    const credInput = document.getElementById("edit-credentials");
-    if (credInput) credInput.value = saved.credentials || "";
-
-    const avatarPrev = document.getElementById("avatar-preview");
-    if (avatarPrev) avatarPrev.src = saved.avatar;
-  } catch (e) {}
+  const saved = _safeJsonParse(localStorage.getItem("hive_profile"), DEFAULT_PROFILE) || DEFAULT_PROFILE;
+  const greetingText = document.getElementById("greeting-text");
+  const locationDisplay = document.getElementById("location-display");
+  if (greetingText) greetingText.innerText = `Hello, ${saved.name.split(" ")[0]}! 👋`;
+  if (locationDisplay) locationDisplay.innerText = saved.credentials || "Authorized Personnel";
 }
 
 function updateCamTime() {
   const el = document.getElementById("cam-time");
-  if (el) el.innerText = new Date().toLocaleTimeString("en-US", { hour12: false });
+  if (el) el.innerText = formatClock(new Date(), true);
 }
 
 function createSwarm(container, className, count) {
@@ -257,60 +342,23 @@ function createSwarm(container, className, count) {
   }
 }
 
-function hexToRgba(hex, alpha = 0.15) {
-  if (!hex || !hex.startsWith("#")) return `rgba(255, 179, 0, ${alpha})`;
-  let c = hex.replace("#", "");
-  if (c.length === 3) c = c.split("").map((ch) => ch + ch).join("");
-  const num = parseInt(c, 16);
-  const r = (num >> 16) & 255;
-  const g = (num >> 8) & 255;
-  const b = num & 255;
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
+function exportData() {
+  if (allLogs.length === 0) return alert("⚠️ No logs to export!");
 
-function playVideo(el, label) {
-  console.log("Selected video item:", label || "LIVE FEED");
-}
-
-function pushAudioLog(eventType, stressLevel = "Normal") {
-  const entry = { timestamp: new Date().toLocaleString(), eventType, stressLevel };
-  audioLogs.unshift(entry);
-  if (audioLogs.length > 20) audioLogs.pop();
-
-  const audioModal = document.getElementById("audio-modal");
-  if (audioModal && !audioModal.classList.contains("hidden")) populateAudioLogs();
-}
-
-function pushVideoLog(eventType, status = "Normal") {
-  const entry = { timestamp: new Date().toLocaleString(), eventType, status };
-  videoLogs.unshift(entry);
-  if (videoLogs.length > 20) videoLogs.pop();
-  populateVideoLogs();
-}
-
-function populateVideoLogs() {
-  const container = document.getElementById("video-events-list");
-  if (!container) return;
-
-  container.innerHTML = "";
-
-  const liveItem = document.createElement("div");
-  liveItem.className = "log-item active";
-  liveItem.innerHTML = "<span>Live</span>";
-  liveItem.onclick = () => playVideo(liveItem, "LIVE FEED");
-  container.appendChild(liveItem);
-
-  if (!videoLogs.length) return;
-
-  videoLogs.forEach((log) => {
-    const div = document.createElement("div");
-    div.className = "log-item";
-    div.innerHTML = `
-      <div style="font-weight:700; margin-bottom:4px;">${log.eventType}</div>
-      <div style="font-size:11px; opacity:0.75;">${log.timestamp} • ${log.status}</div>
-    `;
-    container.appendChild(div);
+  let csvContent = "Timestamp,Event,Value,Status\n";
+  allLogs.forEach((log) => {
+    csvContent += `"${log.timestamp}","${log.eventType}","${log.value}","${log.status}"\n`;
   });
+
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.setAttribute("href", url);
+  link.setAttribute("download", `hive_data_${new Date().toISOString().slice(0, 10)}.csv`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
 }
 
 function updateAudioButtonState(listening) {
@@ -337,12 +385,8 @@ function updateAudioBadge(text, extraClass = "") {
   badge.innerText = text;
 }
 
-function getCameraStatusElement() {
-  return document.querySelector(".card-cam .status-text");
-}
-
 function updateCameraCardStatus(text, color = "") {
-  const camStatus = getCameraStatusElement();
+  const camStatus = document.querySelector(".card-cam .status-text");
   if (!camStatus) return;
   camStatus.innerText = text;
   camStatus.style.color = color;
@@ -362,20 +406,20 @@ function normalizeAudioClass(value) {
   if (raw === "queenless") return "queenless";
   if (raw === "queenright") return "queenright";
   if (raw === "false") return "false";
+  if (raw === "stress") return "stress";
   return "normal";
 }
 
 function normalizeCameraClass(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (raw === "human" || raw === "person" || raw === "hand") return "person";
-  if (raw === "vertebrate" || raw === "animal" || raw === "lizard" || raw === "frog" || raw === "bird" || raw === "gecko" || raw === "rodent")
-    return "vertebrate";
-  if (raw === "other_insect" || raw === "other insect" || raw === "insect" || raw === "ant" || raw === "wasp" || raw === "fly" || raw === "beetle" || raw === "moth")
-    return "other_insect";
+  if (["vertebrate", "animal", "lizard", "frog", "bird", "gecko", "rodent"].includes(raw)) return "vertebrate";
+  if (["other_insect", "other insect", "insect", "ant", "wasp", "fly", "beetle", "moth"].includes(raw)) return "other_insect";
   if (raw === "tb_cluster") return "tb_cluster";
   if (raw === "t_biroi" || raw === "tetragonula biroi") return "t_biroi";
   if (raw === "hive_entrance" || raw === "entrance") return "hive_entrance";
   if (raw === "no_detection") return "no_detection";
+  if (raw === "idle") return "idle";
   return raw || "bee";
 }
 
@@ -386,6 +430,7 @@ function prettyAudioClass(label) {
   if (normalized === "queenless") return "Queenless";
   if (normalized === "queenright") return "Queenright";
   if (normalized === "false") return "False Trigger";
+  if (normalized === "stress") return "Stress";
   return "Normal";
 }
 
@@ -398,28 +443,31 @@ function prettyCameraClass(label) {
   if (normalized === "t_biroi") return "T. biroi";
   if (normalized === "hive_entrance") return "Hive Entrance";
   if (normalized === "no_detection") return "No Detection";
+  if (normalized === "idle") return "Idle";
   if (normalized === "bee") return "Bee";
-  return normalized ? normalized.replaceAll("_", " ").replace(/\b\w/g, (m) => m.toUpperCase()) : "Unknown";
+  return normalized.replaceAll("_", " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
 function getAudioColor(label) {
   const normalized = normalizeAudioClass(label);
   if (normalized === "intruded") return "#ff4757";
   if (normalized === "swarming") return "#f7b731";
-  if (normalized === "queenless" || normalized === "queenright" || normalized === "false") return "#9b59b6";
+  if (["queenless", "queenright", "false", "stress"].includes(normalized)) return "#9b59b6";
   return "#2ecc71";
 }
 
 function getCameraColor(label) {
   const normalized = normalizeCameraClass(label);
   if (normalized === "person" || normalized === "other_insect") return "#ff4757";
-  if (normalized === "tb_cluster" || normalized === "t_biroi" || normalized === "vertebrate") return "#9b59b6";
+  if (["tb_cluster", "t_biroi", "vertebrate"].includes(normalized)) return "#9b59b6";
+  if (normalized === "idle") return "#95a5a6";
   return "#2ecc71";
 }
 
 function prettyColonyState(state) {
-  const s = String(state || "normal_activity");
-  return s.replaceAll("_", " ").replace(/\b\w/g, (m) => m.toUpperCase());
+  return String(state || "normal_activity")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
 function formatPercent(n) {
@@ -432,6 +480,78 @@ function formatTimestamp(ts) {
   const n = Number(ts || 0);
   if (!n) return "Waiting for analysis...";
   return `Last analysis: ${new Date(n * 1000).toLocaleString()}`;
+}
+
+function updateResetAlertButtonState() {
+  const indicator = document.getElementById("reset-alert-indicator");
+  const indicatorText = document.getElementById("reset-alert-indicator-text");
+  const buttonText = document.getElementById("reset-alert-btn-text");
+
+  if (!indicator || !indicatorText || !buttonText) return;
+
+  indicator.classList.remove("reset-idle", "reset-ready", "reset-latched", "reset-working");
+
+  const justReset = Date.now() - lastResetUiTs < 2500;
+
+  if (justReset) {
+    indicator.classList.add("reset-working");
+    indicatorText.innerText = "Reset sent";
+    buttonText.innerText = "Resetting...";
+    return;
+  }
+
+  if (backendAlertLatched || backendAlertAcknowledged) {
+    indicator.classList.add("reset-latched");
+    indicatorText.innerText = "Reset needed";
+    buttonText.innerText = "Reset Alert";
+    return;
+  }
+
+  if (backendAlertActive) {
+    indicator.classList.add("reset-ready");
+    indicatorText.innerText = "Alert active";
+    buttonText.innerText = "Reset Alert";
+    return;
+  }
+
+  indicator.classList.add("reset-idle");
+  indicatorText.innerText = "Idle";
+  buttonText.innerText = "Reset Alert";
+}
+
+function updateBackendStateCards() {
+  const alertState = document.getElementById("backend-alert-state");
+  const alertMeta = document.getElementById("backend-alert-meta");
+  const avState = document.getElementById("audio-video-trigger-state");
+  const avMeta = document.getElementById("audio-video-trigger-meta");
+  const camState = document.getElementById("camera-backend-state");
+  const camMeta = document.getElementById("camera-backend-meta");
+
+  if (alertState) {
+    if (backendAlertLatched || backendAlertAcknowledged) alertState.innerText = "Acknowledged / Latched";
+    else if (backendAlertActive) alertState.innerText = "Active";
+    else alertState.innerText = "Idle";
+  }
+
+  if (alertMeta) {
+    if (backendAlertLatched || backendAlertAcknowledged) {
+      alertMeta.innerText = "No alarm will retrigger until reset";
+    } else if (backendAlertActive) {
+      alertMeta.innerText = `Source: ${backendAlertSource || "unknown"} • Trigger: ${backendTriggerAudioClass || "n/a"}`;
+    } else {
+      alertMeta.innerText = "No active backend alert";
+    }
+  }
+
+  if (avState) avState.innerText = backendAudioVideoTriggerActive ? "Active" : "Inactive";
+  if (avMeta) {
+    avMeta.innerText = backendAudioVideoTriggerActive
+      ? `Class: ${backendAudioVideoTriggerClass || "unknown"}`
+      : "Waiting for audio trigger";
+  }
+
+  if (camState) camState.innerText = backendCameraBackend || "--";
+  if (camMeta) camMeta.innerText = backendVideoAiAlwaysOn ? "Video AI always on" : "Video AI conditional";
 }
 
 function applyAIStatuses(audioClass, cameraClass, colonyState = "", audioAlert = false, logOnly = false, cameraAlert = false, cameraLogOnly = false) {
@@ -449,15 +569,18 @@ function applyAIStatuses(audioClass, cameraClass, colonyState = "", audioAlert =
   if (!isListening) updateAudioCardStatus(prettyAudioClass(normalizedAudio), getAudioColor(normalizedAudio));
   updateCameraCardStatus(prettyCameraClass(normalizedCamera), getCameraColor(normalizedCamera));
 
-  if (latestAudioAlert) updateAudioBadge("Alert", "badge-warning");
+  if (backendAlertLatched || backendAlertAcknowledged) updateAudioBadge("Ack Latched", "badge-logonly");
+  else if (latestAudioAlert) updateAudioBadge("Alert", "badge-warning");
   else if (latestLogOnly) updateAudioBadge("Logs Only", "badge-logonly");
-  else updateAudioBadge("Listening", "");
+  else updateAudioBadge(isListening ? "Listening" : "Ready", "");
 
-  if (latestCameraAlert) {
+  if (backendAlertLatched || backendAlertAcknowledged) {
+    updateCameraBadge("Ack Latched", "badge-logonly");
+  } else if (latestCameraAlert) {
     updateCameraBadge("● Alert", "badge-warning blink-red");
   } else if (latestCameraLogOnly) {
     updateCameraBadge("Logs Only", "badge-logonly");
-  } else if (normalizedCamera === "no_detection") {
+  } else if (normalizedCamera === "no_detection" || normalizedCamera === "idle") {
     updateCameraBadge("Watching", "");
   } else {
     updateCameraBadge("● Live", "blink-red");
@@ -477,146 +600,35 @@ function applyAIStatuses(audioClass, cameraClass, colonyState = "", audioAlert =
   if (colonyStatePill) colonyStatePill.innerText = latestColonyState || "normal_activity";
   if (analysisTimeDisplay) analysisTimeDisplay.innerText = formatTimestamp(Math.max(latestLastAudioTs, latestLastVideoTs));
   if (audioAiTop) audioAiTop.innerText = `${prettyAudioClass(latestAudioClass)} • ${formatPercent(latestAudioConf)}`;
-  if (audioAiNote)
-    audioAiNote.innerText = latestAudioAlert
-      ? "Alert-worthy acoustic pattern detected"
-      : latestLogOnly
-      ? "Acoustic event logged without alarm"
-      : "Always-on acoustic monitoring active";
-  if (audioAlertPill) audioAlertPill.innerText = latestAudioAlert ? "Alert" : latestLogOnly ? "Log Only" : "No Alert";
+  if (audioAiNote) {
+    audioAiNote.innerText = backendAlertLatched
+      ? "Alert acknowledged. Reset required before next alarm"
+      : latestAudioAlert
+        ? "Alert-worthy acoustic pattern detected"
+        : latestLogOnly
+          ? "Acoustic event logged without alarm"
+          : "Always-on acoustic monitoring active";
+  }
+  if (audioAlertPill) {
+    audioAlertPill.innerText = backendAlertLatched ? "Latched" : latestAudioAlert ? "Alert" : latestLogOnly ? "Log Only" : "No Alert";
+  }
+
   if (videoAiTop) videoAiTop.innerText = `${prettyCameraClass(latestCameraClass)} • ${formatPercent(latestCameraConf)}`;
   if (videoAiNote) {
-    if (latestCameraAlert) videoAiNote.innerText = "Alert + log triggered by video detection";
+    if (backendAlertLatched) videoAiNote.innerText = "Alert latched. Reset required for next alarm";
+    else if (latestCameraAlert) videoAiNote.innerText = "Alert + log triggered by video detection";
     else if (latestCameraLogOnly) videoAiNote.innerText = "Video detection logged without alarm";
     else if (latestCameraDetections.length) videoAiNote.innerText = `${latestCameraDetections.length} object(s) detected at entrance`;
     else videoAiNote.innerText = "Entrance object detection standby";
   }
-  if (videoAlertPill) videoAlertPill.innerText = latestCameraAlert ? "Alert" : latestCameraLogOnly ? "Log Only" : "Watching";
+  if (videoAlertPill) {
+    videoAlertPill.innerText = backendAlertLatched ? "Latched" : latestCameraAlert ? "Alert" : latestCameraLogOnly ? "Log Only" : "Watching";
+  }
 
   updateAudioModalStatus();
   updateVideoModalStatus();
-}
-
-function shouldRaiseAlert(audioClass, cameraClass, colonyState = "", audioAlert = false, cameraAlert = false) {
-  const normalizedAudio = normalizeAudioClass(audioClass);
-  const state = String(colonyState || "").toLowerCase();
-
-  if (audioAlert) return true;
-  if (cameraAlert) return true;
-  if (normalizedAudio === "intruded" || normalizedAudio === "swarming") return true;
-  if (state.includes("intrusion") || state.includes("swarming")) return true;
-  return false;
-}
-
-function maybeTriggerAIAlert(audioClass, cameraClass, colonyState = "", audioAlert = false, cameraAlert = false) {
-  const normalizedAudio = normalizeAudioClass(audioClass);
-  const normalizedCamera = normalizeCameraClass(cameraClass);
-  const state = String(colonyState || "").toLowerCase();
-
-  let message = "";
-  let title = "🚨 HIVE ALERT!";
-
-  if (normalizedAudio === "intruded" || state.includes("intrusion")) {
-    message = "⚠️ INTRUSION DETECTED!";
-    title = "🚨 INTRUSION DETECTED!";
-  } else if (normalizedCamera === "person" && cameraAlert) {
-    message = "🚨 PERSON DETECTED NEAR HIVE!";
-    title = "🚨 PERSON DETECTED!";
-  } else if (normalizedCamera === "other_insect" && cameraAlert) {
-    message = "⚠️ OTHER INSECT DETECTED!";
-    title = "⚠️ OTHER INSECT DETECTED!";
-  } else if (normalizedAudio === "swarming" || state.includes("swarming")) {
-    message = "🐝 SWARMING / READY FOR SPLIT!";
-    title = "🐝 SWARMING DETECTED!";
-  } else if (audioAlert) {
-    message = "⚠️ HIVE AI ALERT TRIGGERED!";
-  }
-
-  if (!message) return;
-
-  const alertKey = `${normalizedAudio}|${normalizedCamera}|${state}|${message}`;
-  if (lastAlertKey === alertKey) return;
-  lastAlertKey = alertKey;
-
-  showAcousticAlert(message, title);
-}
-
-function ensureAudioContext() {
-  if (!audioContext) {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    audioContext = new Ctx();
-    audioMasterGain = audioContext.createGain();
-    audioMasterGain.gain.value = 2.5;
-    audioMasterGain.connect(audioContext.destination);
-    audioNextPlayTime = audioContext.currentTime + 0.05;
-  }
-  return audioContext;
-}
-
-async function ensureAudioContextRunning() {
-  const ctx = ensureAudioContext();
-  if (ctx.state === "suspended") await ctx.resume();
-  return ctx;
-}
-
-function resampleLinear(input, inRate, outRate) {
-  if (inRate === outRate) return input;
-  const ratio = outRate / inRate;
-  const outLen = Math.max(1, Math.floor(input.length * ratio));
-  const output = new Float32Array(outLen);
-
-  for (let i = 0; i < outLen; i++) {
-    const srcIndex = i / ratio;
-    const i0 = Math.floor(srcIndex);
-    const i1 = Math.min(i0 + 1, input.length - 1);
-    const frac = srcIndex - i0;
-    output[i] = input[i0] * (1 - frac) + input[i1] * frac;
-  }
-  return output;
-}
-
-function initChart() {
-  const canvas = document.getElementById("hiveChart");
-  if (!canvas) return;
-
-  const ctx = canvas.getContext("2d");
-  hiveChart = new Chart(ctx, {
-    type: "line",
-    data: {
-      labels: [],
-      datasets: [
-        { label: "Temp", data: [], borderColor: "#ff7675", tension: 0.4, pointRadius: 0, yAxisID: "y" },
-        { label: "Hum", data: [], borderColor: "#74b9ff", tension: 0.4, pointRadius: 0, yAxisID: "y" },
-        { label: "Weight", data: [], borderColor: "#ffeaa7", tension: 0.4, pointRadius: 0, yAxisID: "y1" },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: "index", intersect: false },
-      plugins: { legend: { display: true, position: "bottom", labels: { boxWidth: 10 } } },
-      scales: {
-        x: { display: false },
-        y: { display: false, position: "left" },
-        y1: { display: false, position: "right", grid: { drawOnChartArea: false } },
-      },
-      animation: false,
-    },
-  });
-}
-
-function _extractTempHumWeight(data) {
-  const temp = data?.temp_c ?? data?.temp ?? data?.temperature ?? null;
-  const hum = data?.hum_pct ?? data?.hum ?? data?.humidity ?? null;
-
-  let weight = data?.weight_kg ?? data?.weight ?? null;
-  const weight_g = data?.weight_g ?? null;
-
-  if ((weight === null || weight === undefined) && weight_g !== null && weight_g !== undefined) {
-    const g = Number(weight_g);
-    if (!Number.isNaN(g)) weight = g / 1000.0;
-  }
-  return { temp, hum, weight };
+  updateBackendStateCards();
+  updateResetAlertButtonState();
 }
 
 function getHighestCameraDetection(detections) {
@@ -633,7 +645,9 @@ function updateAudioModalStatus() {
 
   if (topClass) topClass.innerText = prettyAudioClass(latestAudioClass);
   if (topConf) topConf.innerText = `Confidence: ${formatPercent(latestAudioConf)}`;
-  if (alertMode) alertMode.innerText = latestAudioAlert ? "Alert" : latestLogOnly ? "Log Only" : "No Alert";
+  if (alertMode) {
+    alertMode.innerText = backendAlertLatched ? "Latched / Ack" : latestAudioAlert ? "Alert" : latestLogOnly ? "Log Only" : "No Alert";
+  }
   if (colonyNote) colonyNote.innerText = `Colony state: ${latestColonyState || "normal_activity"}`;
 
   if (!scoreList) return;
@@ -670,9 +684,10 @@ function updateVideoModalStatus() {
 
   if (topDetection) topDetection.innerText = top ? prettyCameraClass(top.class) : prettyCameraClass(latestCameraClass);
 
-  let metaParts = [];
+  const metaParts = [];
   metaParts.push(`Confidence: ${top ? formatPercent(top.conf) : formatPercent(latestCameraConf)}`);
-  if (latestCameraAlert) metaParts.push("Mode: Alert + Log");
+  if (backendAlertLatched) metaParts.push("Mode: Latched");
+  else if (latestCameraAlert) metaParts.push("Mode: Alert + Log");
   else if (latestCameraLogOnly) metaParts.push("Mode: Log Only");
   else metaParts.push("Mode: Monitor");
 
@@ -693,8 +708,8 @@ function updateVideoModalStatus() {
         cls === "person" || cls === "other_insect"
           ? "Alert + Log"
           : cls === "tb_cluster" || cls === "t_biroi" || cls === "vertebrate"
-          ? "Log Only"
-          : "Monitor";
+            ? "Log Only"
+            : "Monitor";
       return `
         <div class="detection-chip">
           <div class="det-main">
@@ -708,328 +723,92 @@ function updateVideoModalStatus() {
     .join("");
 }
 
-async function updateData() {
-  if (isFetchingLatest) return;
-  isFetchingLatest = true;
+function updateAudioParamLabels() {
+  const rate = document.getElementById("audio-param-rate");
+  const channels = document.getElementById("audio-param-channels");
+  const bitdepth = document.getElementById("audio-param-bitdepth");
+  const view = document.getElementById("audio-param-view");
 
-  let t = 0,
-    h = 0,
-    rawW = 0;
-  let audioClass = latestAudioClass || "normal";
-  let cameraClass = latestCameraClass || "bee";
-  let colonyState = latestColonyState || "normal_activity";
-  let audioConf = latestAudioConf || 0;
-  let cameraConf = latestCameraConf || 0;
-  let audioScores = latestAudioScores || [];
-  let cameraDetections = latestCameraDetections || [];
-  let audioAlert = latestAudioAlert || false;
-  let logOnly = latestLogOnly || false;
-  let cameraAlert = latestCameraAlert || false;
-  let cameraLogOnly = latestCameraLogOnly || false;
-  let lastAudioTs = latestLastAudioTs || 0;
-  let lastVideoTs = latestLastVideoTs || 0;
-  let isOffline = false;
-
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-    const response = await fetch(RPI_URL, { signal: controller.signal });
-
-    clearTimeout(timeoutId);
-    if (!response.ok) throw new Error("RPi Error");
-
-    const data = await response.json();
-
-    const extracted = _extractTempHumWeight(data);
-    t = extracted.temp !== null ? parseFloat(extracted.temp).toFixed(1) : "--";
-    h = extracted.hum !== null ? parseFloat(extracted.hum).toFixed(0) : "--";
-    rawW = extracted.weight !== null ? parseFloat(extracted.weight) : 0;
-
-    audioClass = normalizeAudioClass(data.audio_class || data.sound_status || "normal");
-    cameraClass = normalizeCameraClass(data.camera_class || data.vision_class || data.detected_object || "bee");
-
-    colonyState = data.colony_state || colonyState;
-    audioConf = Number(data.audio_conf || 0);
-    cameraConf = Number(data.camera_conf || 0);
-    audioScores = Array.isArray(data.audio_scores) ? data.audio_scores : [];
-    cameraDetections = Array.isArray(data.camera_detections) ? data.camera_detections : [];
-    audioAlert = Boolean(data.audio_alert);
-    logOnly = Boolean(data.log_only);
-    cameraAlert = Boolean(data.camera_alert);
-    cameraLogOnly = Boolean(data.camera_log_only);
-    lastAudioTs = Number(data.last_audio_analysis_ts || 0);
-    lastVideoTs = Number(data.last_video_analysis_ts || 0);
-
-    latestAudioClass = audioClass;
-    latestAudioConf = audioConf;
-    latestAudioScores = audioScores;
-    latestCameraClass = cameraClass;
-    latestCameraConf = cameraConf;
-    latestCameraDetections = cameraDetections;
-    latestColonyState = colonyState;
-    latestAudioAlert = audioAlert;
-    latestLogOnly = logOnly;
-    latestCameraAlert = cameraAlert;
-    latestCameraLogOnly = cameraLogOnly;
-    latestLastAudioTs = lastAudioTs;
-    latestLastVideoTs = lastVideoTs;
-  } catch (error) {
-    const isAbort = error && (error.name === "AbortError" || String(error).includes("AbortError"));
-    if (!isAbort) console.error("Connection Failed:", error);
-    isOffline = true;
-    t = "--";
-    h = "--";
-    rawW = 0;
-  } finally {
-    isFetchingLatest = false;
-  }
-
-  let netW = 0,
-    displayW = "--";
-  if (!isNaN(rawW) && !isOffline) {
-    netW = rawW - HIVE_TARE_WEIGHT;
-    if (netW < 0) netW = 0;
-    displayW = netW.toFixed(2);
-  }
-
-  currentTemp = t;
-  currentHum = h;
-  currentWeight = displayW;
-
-  const tempDisplayEl = document.getElementById("temp-display");
-  const humDisplayEl = document.getElementById("hum-display");
-  const weightDisplayEl = document.getElementById("weight-display");
-
-  if (tempDisplayEl) tempDisplayEl.innerText = t + "°C";
-  if (humDisplayEl) humDisplayEl.innerText = h + "%";
-  if (weightDisplayEl) weightDisplayEl.innerText = displayW + " kg";
-
-  applyAIStatuses(audioClass, cameraClass, colonyState, audioAlert, logOnly, cameraAlert, cameraLogOnly);
-
-  if (tempDisplayEl) {
-    if (!isOffline && parseFloat(t) > CONFIG.temp.max) {
-      tempDisplayEl.style.color = "#ff4757";
-      if (!alarmInterval) showAcousticAlert(`🔥 HIGH HEAT: ${t}°C`, "🔥 HIGH TEMPERATURE!");
-    } else {
-      tempDisplayEl.style.color = "";
-    }
-  }
-
-  if (!isOffline) {
-    const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
-    timeLabels.push(time);
-    tempHistory.push(parseFloat(t));
-    humHistory.push(parseFloat(h));
-    weightHistory.push(netW);
-
-    if (timeLabels.length > MAX_HISTORY) {
-      timeLabels.shift();
-      tempHistory.shift();
-      humHistory.shift();
-      weightHistory.shift();
-    }
-
-    if (hiveChart) {
-      hiveChart.data.labels = timeLabels;
-      hiveChart.data.datasets[0].data = tempHistory;
-      hiveChart.data.datasets[1].data = humHistory;
-      hiveChart.data.datasets[2].data = weightHistory;
-      hiveChart.update("none");
-    }
-
-    const detailedModal = document.getElementById("detailed-graph-modal");
-    if (detailedChart && detailedModal && !detailedModal.classList.contains("hidden")) {
-      const title = document.getElementById("detailed-graph-title").innerText;
-      if (title.includes("Temperature")) updateDetailedChart(tempHistory, timeLabels);
-      else if (title.includes("Humidity")) updateDetailedChart(humHistory, timeLabels);
-      else if (title.includes("Weight")) updateDetailedChart(weightHistory, timeLabels);
-    }
-
-    if (shouldRaiseAlert(audioClass, cameraClass, colonyState, audioAlert, cameraAlert)) {
-      if (!alarmInterval) maybeTriggerAIAlert(audioClass, cameraClass, colonyState, audioAlert, cameraAlert);
-    }
-  }
-
-  const highestCameraConf = getHighestCameraDetection(cameraDetections)?.conf || cameraConf || 0;
-  const highestConf = Math.max(audioConf, highestCameraConf);
-
-  if (!isOffline && Math.random() > 0.8) {
-    let logStatus = "Normal";
-    let logEvent = `Audio: ${prettyAudioClass(audioClass)} | Camera: ${prettyCameraClass(cameraClass)}`;
-
-    if (audioAlert || cameraAlert) {
-      logStatus = "Warning";
-    } else if (logOnly || cameraLogOnly) {
-      logStatus = "Logged";
-    }
-
-    if (audioClass === "swarming") {
-      logStatus = "Warning";
-      logEvent = "Audio: Swarming / Ready for Split";
-    }
-
-    if (audioClass === "queenless") {
-      logStatus = "Logged";
-      logEvent = "Audio: Queenless state detected";
-    }
-
-    if (audioClass === "queenright") {
-      logStatus = "Logged";
-      logEvent = "Audio: Queenright state detected";
-    }
-
-    if (audioClass === "false") {
-      logStatus = "Logged";
-      logEvent = "Audio: False trigger recorded";
-    }
-
-    if (cameraClass === "person") {
-      logStatus = "Warning";
-      logEvent = "Video: Person detected";
-    }
-
-    if (cameraClass === "other_insect") {
-      logStatus = "Warning";
-      logEvent = "Video: Other insect detected";
-    }
-
-    if (cameraClass === "tb_cluster") {
-      logStatus = "Logged";
-      logEvent = "Video: TB cluster detected";
-    }
-
-    if (cameraClass === "t_biroi") {
-      logStatus = "Logged";
-      logEvent = "Video: T. biroi detected";
-    }
-
-    if (cameraClass === "vertebrate") {
-      logStatus = "Logged";
-      logEvent = "Video: Vertebrate detected";
-    }
-
-    if (parseFloat(t) > CONFIG.temp.max) {
-      logStatus = "Warning";
-      logEvent = "Env: High Temp";
-    }
-
-    const statusClass =
-      logStatus === "Normal" ? "badge-normal" : logStatus === "Logged" ? "badge-logonly" : "badge-warning";
-
-    const tbody = document.querySelector("#logs-table tbody");
-
-    if (tbody) {
-      const row = `
-        <tr>
-          <td>${new Date().toLocaleTimeString()}</td>
-          <td>${logEvent}</td>
-          <td>${t}°C / ${h}% / ${displayW}kg</td>
-          <td class="conf-text">${highestConf > 0 ? `${(highestConf * 100).toFixed(0)}%` : "0%"}</td>
-          <td><span class="log-badge ${statusClass}">${logStatus}</span></td>
-        </tr>
-      `;
-      tbody.insertAdjacentHTML("afterbegin", row);
-      if (tbody.rows.length > 20) tbody.deleteRow(20);
-    }
-
-    allLogs.unshift({
-      timestamp: new Date().toLocaleString(),
-      eventType: logEvent,
-      value: `${t}°C | ${displayW}kg`,
-      status: logStatus,
-    });
-  }
-
-  updateAudioModalStatus();
-  updateVideoModalStatus();
-
-  if (cameraDetections.length) {
-    const topDet = getHighestCameraDetection(cameraDetections);
-    if (topDet) {
-      const normalized = normalizeCameraClass(topDet.class);
-      if (normalized === "person" || normalized === "other_insect") {
-        pushVideoLog(`${prettyCameraClass(topDet.class)} detected`, "Warning");
-      } else if (normalized === "tb_cluster" || normalized === "t_biroi" || normalized === "vertebrate") {
-        pushVideoLog(`${prettyCameraClass(topDet.class)} logged`, "Logged");
-      }
-    }
-  }
-
-  if (audioAlert) {
-    pushAudioLog(`${prettyAudioClass(audioClass)} detected`, "High");
-  } else if (logOnly) {
-    pushAudioLog(`${prettyAudioClass(audioClass)} logged`, "Normal");
-  }
+  if (rate) rate.innerText = `${AUDIO_STREAM_FORMAT.sampleRate} Hz`;
+  if (channels) channels.innerText = `${AUDIO_STREAM_FORMAT.channels}`;
+  if (bitdepth) bitdepth.innerText = `${AUDIO_STREAM_FORMAT.bitDepth}-bit`;
+  if (view) view.innerText = `${WAVE_VIEW_SECONDS.toFixed(1)}s`;
 }
 
-function startDataUpdates() {
-  if (updateIntervalId) clearInterval(updateIntervalId);
-  const rate = SETTINGS.refreshRate || 2000;
-  updateIntervalId = setInterval(updateData, rate);
-}
+function _readAudioVizFromUI() {
+  const zy = document.getElementById("audio-zoom-y");
+  const zx = document.getElementById("audio-zoom-x");
+  const ax = document.getElementById("audio-show-axes");
+  const gr = document.getElementById("audio-show-grid");
 
-function manualRefresh() {
-  const icon = document.querySelector(".refresh-btn-global i");
-  if (icon) icon.classList.add("fa-spin");
+  if (zy) {
+    const v = Number(zy.value);
+    if (!Number.isNaN(v) && v > 0) AUDIO_VIZ.zoomY = v;
+  }
+  if (zx) {
+    const v = Number(zx.value);
+    if (!Number.isNaN(v) && v > 0) AUDIO_VIZ.zoomX = v;
+  }
+  if (ax) AUDIO_VIZ.showAxes = !!ax.checked;
+  if (gr) AUDIO_VIZ.showGrid = !!gr.checked;
 
-  updateData().then(() => {
-    setTimeout(() => {
-      if (icon) icon.classList.remove("fa-spin");
-    }, 800);
-  });
-}
-
-function toggleDashboardMenu() {
-  const menu = document.getElementById("dashboard-mobile-dropdown");
-  if (menu) menu.classList.toggle("hidden");
-}
-
-function saveSettings() {
-  const refreshEl = document.getElementById("setting-refresh");
-  const audioEl = document.getElementById("setting-audio");
-  const sensitivityEl = document.getElementById("setting-sensitivity");
-
-  if (refreshEl) SETTINGS.refreshRate = parseInt(refreshEl.value, 10);
-  if (audioEl) SETTINGS.audioEnabled = audioEl.checked;
-  if (sensitivityEl) SETTINGS.sensitivity = parseInt(sensitivityEl.value, 10);
-
+  SETTINGS.audioZoomX = AUDIO_VIZ.zoomX;
+  SETTINGS.audioZoomY = AUDIO_VIZ.zoomY;
+  SETTINGS.audioShowAxes = AUDIO_VIZ.showAxes;
+  SETTINGS.audioShowGrid = AUDIO_VIZ.showGrid;
   localStorage.setItem("hive_settings", JSON.stringify(SETTINGS));
-  startDataUpdates();
-  alert("✅ Settings Saved!");
 }
 
-function resetSettings() {
-  localStorage.removeItem("hive_settings");
-  location.reload();
+function hexToRgba(hex, alpha = 0.15) {
+  if (!hex || !hex.startsWith("#")) return `rgba(255, 179, 0, ${alpha})`;
+  let c = hex.replace("#", "");
+  if (c.length === 3) c = c.split("").map((ch) => ch + ch).join("");
+  const num = parseInt(c, 16);
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-function exportData() {
-  if (allLogs.length === 0) return alert("⚠️ No logs to export!");
+function initChart() {
+  const canvas = document.getElementById("hiveChart");
+  if (!canvas) return;
 
-  let csvContent = "Timestamp,Event,Value,Status\n";
-  allLogs.forEach((log) => {
-    csvContent += `"${log.timestamp}","${log.eventType}","${log.value}","${log.status}"\n`;
+  const ctx = canvas.getContext("2d");
+  hiveChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        { label: "Temp", data: [], borderColor: "#ff7675", tension: 0.4, pointRadius: 0, yAxisID: "y" },
+        { label: "Hum", data: [], borderColor: "#74b9ff", tension: 0.4, pointRadius: 0, yAxisID: "y" },
+        { label: "Weight", data: [], borderColor: "#ffeaa7", tension: 0.4, pointRadius: 0, yAxisID: "y1" },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: { legend: { display: true, position: "bottom", labels: { boxWidth: 10 } } },
+      scales: {
+        x: { display: false },
+        y: { display: false, position: "left" },
+        y1: { display: false, position: "right", grid: { drawOnChartArea: false } },
+      },
+      animation: false,
+    },
   });
-
-  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.setAttribute("href", url);
-  link.setAttribute("download", `hive_data_${new Date().toISOString().slice(0, 10)}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
 }
 
 function openDetailedGraphOnCardClick(type) {
   const modal = document.getElementById("detailed-graph-modal");
   if (!modal) return;
-
   modal.classList.remove("hidden");
 
-  let title, color, dataArray;
+  let title;
+  let color;
+  let dataArray;
+
   if (type === "temp") {
     title = "Temperature Trend";
     color = "#ff7675";
@@ -1046,7 +825,9 @@ function openDetailedGraphOnCardClick(type) {
     return;
   }
 
-  document.getElementById("detailed-graph-title").innerText = title;
+  const titleEl = document.getElementById("detailed-graph-title");
+  if (titleEl) titleEl.innerText = title;
+
   if (detailedChart) detailedChart.destroy();
 
   const canvas = document.getElementById("detailedChart");
@@ -1091,36 +872,402 @@ function updateDetailedChart(dataArray, labels) {
 
 function updateDetailedStats(dataArray) {
   if (!dataArray || dataArray.length === 0) return;
-
   const nums = dataArray.map((n) => parseFloat(n)).filter((n) => !isNaN(n));
-  if (nums.length === 0) return;
+  if (!nums.length) return;
 
   const sum = nums.reduce((a, b) => a + b, 0);
   const avg = (sum / nums.length).toFixed(2);
 
-  document.getElementById("graph-current").innerText = nums[nums.length - 1].toFixed(2);
-  document.getElementById("graph-max").innerText = Math.max(...nums).toFixed(2);
-  document.getElementById("graph-min").innerText = Math.min(...nums).toFixed(2);
-  document.getElementById("graph-avg").innerText = avg;
+  const map = {
+    "graph-current": nums[nums.length - 1].toFixed(2),
+    "graph-max": Math.max(...nums).toFixed(2),
+    "graph-min": Math.min(...nums).toFixed(2),
+    "graph-avg": avg,
+  };
+
+  Object.entries(map).forEach(([id, value]) => {
+    const el = document.getElementById(id);
+    if (el) el.innerText = value;
+  });
 }
 
 function closeDetailedGraphModal() {
-  document.getElementById("detailed-graph-modal").classList.add("hidden");
+  document.getElementById("detailed-graph-modal")?.classList.add("hidden");
 }
 
-function switchPublicTab(tabId) {
-  document.querySelectorAll(".public-section").forEach((sec) => sec.classList.add("hidden"));
-  document.getElementById(tabId).classList.remove("hidden");
-  if (tabId === "hero") window.scrollTo(0, 0);
+function pushAudioLog(eventType, stressLevel = "Normal") {
+  const key = `${eventType}|${stressLevel}`;
+  if (key === lastAudioLogKey) return;
+  lastAudioLogKey = key;
+  setTimeout(() => {
+    if (lastAudioLogKey === key) lastAudioLogKey = "";
+  }, 1500);
+
+  const entry = { timestamp: new Date().toLocaleString(), eventType, stressLevel };
+  audioLogs.unshift(entry);
+  if (audioLogs.length > 20) audioLogs.pop();
+
+  const audioModal = document.getElementById("audio-modal");
+  if (audioModal && !audioModal.classList.contains("hidden")) populateAudioLogs();
 }
 
-function toggleMobileMenu() {
-  document.getElementById("mobile-public-menu").classList.toggle("hidden");
+function pushVideoLog(eventType, status = "Normal") {
+  const key = `${eventType}|${status}`;
+  if (key === lastVideoLogKey) return;
+  lastVideoLogKey = key;
+  setTimeout(() => {
+    if (lastVideoLogKey === key) lastVideoLogKey = "";
+  }, 1500);
+
+  const entry = { timestamp: new Date().toLocaleString(), eventType, status };
+  videoLogs.unshift(entry);
+  if (videoLogs.length > 20) videoLogs.pop();
+  populateVideoLogs();
 }
 
-function mobileNavClick(tabId) {
-  switchPublicTab(tabId);
-  toggleMobileMenu();
+function populateVideoLogs() {
+  const container = document.getElementById("video-events-list");
+  if (!container) return;
+
+  container.innerHTML = "";
+
+  const liveItem = document.createElement("div");
+  liveItem.className = "log-item active";
+  liveItem.innerHTML = "<span>Live</span>";
+  liveItem.onclick = () => playVideo(liveItem, "LIVE FEED");
+  container.appendChild(liveItem);
+
+  if (!videoLogs.length) return;
+
+  videoLogs.forEach((log) => {
+    const div = document.createElement("div");
+    div.className = "log-item";
+    div.innerHTML = `
+      <div style="font-weight:700; margin-bottom:4px;">${log.eventType}</div>
+      <div style="font-size:11px; opacity:0.75;">${log.timestamp} • ${log.status}</div>
+    `;
+    container.appendChild(div);
+  });
+}
+
+function populateAudioLogs() {
+  const container = document.getElementById("audio-events-list");
+  if (!container) return;
+
+  container.innerHTML = "";
+
+  if (!audioLogs.length) {
+    container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">No audio events recorded</div>';
+    return;
+  }
+
+  audioLogs.forEach((log) => {
+    const div = document.createElement("div");
+    div.className = "audio-event-item";
+    div.innerHTML = `
+      <div class="timestamp">${log.timestamp}</div>
+      <div class="event-type">
+        <span>${log.eventType}</span>
+        <span class="stress-indicator ${log.stressLevel === "Normal" ? "stress-normal" : "stress-high"}">${log.stressLevel}</span>
+      </div>
+    `;
+    container.appendChild(div);
+  });
+}
+
+function playVideo(el, label) {
+  console.log("Selected video item:", label || "LIVE FEED");
+}
+
+function deleteVideoLogs() {
+  videoLogs = [];
+  populateVideoLogs();
+}
+
+function deleteAudioLogs() {
+  audioLogs = [];
+  populateAudioLogs();
+}
+
+function _extractTempHumWeight(data) {
+  const temp = data?.temp_c ?? data?.temp ?? data?.temperature ?? null;
+  const hum = data?.hum_pct ?? data?.hum ?? data?.humidity ?? null;
+  let weight = data?.weight_kg ?? data?.weight ?? null;
+  const weight_g = data?.weight_g ?? null;
+
+  if ((weight === null || weight === undefined) && weight_g !== null && weight_g !== undefined) {
+    const g = Number(weight_g);
+    if (!Number.isNaN(g)) weight = g / 1000.0;
+  }
+  return { temp, hum, weight };
+}
+
+async function updateData() {
+  if (isFetchingLatest) return;
+  isFetchingLatest = true;
+
+  let t = "--";
+  let h = "--";
+  let rawW = 0;
+  let isOffline = false;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    const response = await apiFetch(RPI_URL, {
+      signal: controller.signal,
+      cache: "no-store",
+    });
+
+    clearTimeout(timeoutId);
+    if (!response.ok) throw new Error(`RPi Error: ${response.status}`);
+
+    const data = await response.json();
+
+    const extracted = _extractTempHumWeight(data);
+    t = extracted.temp !== null ? parseFloat(extracted.temp).toFixed(1) : "--";
+    h = extracted.hum !== null ? parseFloat(extracted.hum).toFixed(0) : "--";
+    rawW = extracted.weight !== null ? parseFloat(extracted.weight) : 0;
+
+    latestAudioClass = normalizeAudioClass(data.audio_class || "normal");
+    latestAudioConf = Number(data.audio_conf || 0);
+    latestAudioScores = Array.isArray(data.audio_scores) ? data.audio_scores : [];
+    latestAudioAlert = Boolean(data.audio_alert);
+    latestLogOnly = Boolean(data.log_only);
+
+    latestCameraClass = normalizeCameraClass(data.camera_class || "idle");
+    latestCameraConf = Number(data.camera_conf || 0);
+    latestCameraDetections = Array.isArray(data.camera_detections) ? data.camera_detections : [];
+    latestCameraAlert = Boolean(data.camera_alert);
+    latestCameraLogOnly = Boolean(data.camera_log_only);
+
+    latestColonyState = data.colony_state || "normal_activity";
+    latestLastAudioTs = Number(data.last_audio_analysis_ts || 0);
+    latestLastVideoTs = Number(data.last_video_analysis_ts || 0);
+
+    backendAlertActive = Boolean(data.alert_active);
+    backendAlertAcknowledged = Boolean(data.alert_acknowledged);
+    backendAlertLatched = Boolean(data.alert_latched);
+    backendAlertSource = data.alert_source || null;
+    backendTriggerAudioClass = data.trigger_audio_class || null;
+    backendTriggeredAt = Number(data.triggered_at || 0);
+    backendManualVideoActive = Boolean(data.manual_video_active);
+    backendAudioVideoTriggerActive = Boolean(data.audio_video_trigger_active);
+    backendAudioVideoTriggerClass = data.audio_video_trigger_class || null;
+    backendAudioVideoTriggeredAt = Number(data.audio_video_triggered_at || 0);
+    backendCameraBackend = data.camera_backend || "--";
+    backendVideoAiAlwaysOn = Boolean(data.video_ai_always_on);
+
+    alertAcknowledged = backendAlertAcknowledged || backendAlertLatched;
+  } catch (error) {
+    const isAbort = error && (error.name === "AbortError" || String(error).includes("AbortError"));
+    if (!isAbort) console.error("Connection Failed:", error);
+    isOffline = true;
+  } finally {
+    isFetchingLatest = false;
+  }
+
+  let netW = 0;
+  let displayW = "--";
+  if (!isNaN(rawW) && !isOffline) {
+    netW = rawW - HIVE_TARE_WEIGHT;
+    if (netW < 0) netW = 0;
+    displayW = netW.toFixed(2);
+  }
+
+  currentTemp = t;
+  currentHum = h;
+  currentWeight = displayW;
+
+  const tempDisplayEl = document.getElementById("temp-display");
+  const humDisplayEl = document.getElementById("hum-display");
+  const weightDisplayEl = document.getElementById("weight-display");
+
+  if (tempDisplayEl) tempDisplayEl.innerText = `${t}°C`;
+  if (humDisplayEl) humDisplayEl.innerText = `${h}%`;
+  if (weightDisplayEl) weightDisplayEl.innerText = `${displayW} kg`;
+
+  applyAIStatuses(
+    latestAudioClass,
+    latestCameraClass,
+    latestColonyState,
+    latestAudioAlert,
+    latestLogOnly,
+    latestCameraAlert,
+    latestCameraLogOnly
+  );
+
+  if (tempDisplayEl) {
+    if (!isOffline && parseFloat(t) > CONFIG.temp.max && !alertAcknowledged) {
+      tempDisplayEl.style.color = "#ff4757";
+      if (!alarmInterval && !backendAlertLatched) showAcousticAlert(`🔥 HIGH HEAT: ${t}°C`, "🔥 HIGH TEMPERATURE!");
+    } else {
+      tempDisplayEl.style.color = "";
+    }
+  }
+
+  if (!isOffline) {
+    const time = formatClock(new Date(), false);
+
+    timeLabels.push(time);
+    tempHistory.push(parseFloat(t));
+    humHistory.push(parseFloat(h));
+    weightHistory.push(netW);
+
+    while (timeLabels.length > MAX_HISTORY) {
+      timeLabels.shift();
+      tempHistory.shift();
+      humHistory.shift();
+      weightHistory.shift();
+    }
+
+    if (hiveChart) {
+      hiveChart.data.labels = timeLabels;
+      hiveChart.data.datasets[0].data = tempHistory;
+      hiveChart.data.datasets[1].data = humHistory;
+      hiveChart.data.datasets[2].data = weightHistory;
+      hiveChart.update("none");
+    }
+
+    const detailedModal = document.getElementById("detailed-graph-modal");
+    const detailedTitle = document.getElementById("detailed-graph-title");
+    if (detailedChart && detailedModal && detailedTitle && !detailedModal.classList.contains("hidden")) {
+      const title = detailedTitle.innerText;
+      if (title.includes("Temperature")) updateDetailedChart(tempHistory, timeLabels);
+      else if (title.includes("Humidity")) updateDetailedChart(humHistory, timeLabels);
+      else if (title.includes("Weight")) updateDetailedChart(weightHistory, timeLabels);
+    }
+
+    if (backendAlertActive && !alertAcknowledged) {
+      maybeTriggerAIAlert();
+      if (SETTINGS.autoOpenVideoOnAlert && !backendManualVideoActive) {
+        const videoModal = document.getElementById("video-modal");
+        if (videoModal && videoModal.classList.contains("hidden")) {
+          openVideoModal();
+        }
+      }
+    }
+  }
+
+  const highestCameraConf = getHighestCameraDetection(latestCameraDetections)?.conf || latestCameraConf || 0;
+  const highestConf = Math.max(latestAudioConf, highestCameraConf);
+
+  if (!isOffline && Math.random() > 0.8) {
+    let logStatus = "Normal";
+    let logEvent = `Audio: ${prettyAudioClass(latestAudioClass)} | Camera: ${prettyCameraClass(latestCameraClass)}`;
+
+    if (backendAlertLatched) {
+      logStatus = "Logged";
+      logEvent = `Alert acknowledged / latched (${prettyAudioClass(latestAudioClass)})`;
+    } else if (latestAudioAlert || latestCameraAlert || backendAlertActive) {
+      logStatus = "Warning";
+    } else if (latestLogOnly || latestCameraLogOnly) {
+      logStatus = "Logged";
+    }
+
+    if (parseFloat(t) > CONFIG.temp.max && !alertAcknowledged) {
+      logStatus = "Warning";
+      logEvent = "Env: High Temp";
+    }
+
+    const statusClass = logStatus === "Normal" ? "badge-normal" : logStatus === "Logged" ? "badge-logonly" : "badge-warning";
+    const tbody = document.querySelector("#logs-table tbody");
+
+    if (tbody) {
+      const row = `
+        <tr>
+          <td>${formatClock(new Date(), true)}</td>
+          <td>${logEvent}</td>
+          <td>${t}°C / ${h}% / ${displayW}kg</td>
+          <td class="conf-text">${highestConf > 0 ? `${(highestConf * 100).toFixed(0)}%` : "0%"}</td>
+          <td><span class="log-badge ${statusClass}">${logStatus}</span></td>
+        </tr>
+      `;
+      tbody.insertAdjacentHTML("afterbegin", row);
+      if (tbody.rows.length > 20) tbody.deleteRow(20);
+    }
+
+    allLogs.unshift({
+      timestamp: new Date().toLocaleString(),
+      eventType: logEvent,
+      value: `${t}°C | ${displayW}kg`,
+      status: logStatus,
+    });
+    if (allLogs.length > 100) allLogs.pop();
+  }
+
+  if (latestCameraDetections.length) {
+    const topDet = getHighestCameraDetection(latestCameraDetections);
+    if (topDet) {
+      const normalized = normalizeCameraClass(topDet.class);
+      if (normalized === "person" || normalized === "other_insect") {
+        pushVideoLog(`${prettyCameraClass(topDet.class)} detected`, backendAlertLatched ? "Logged" : "Warning");
+      } else if (normalized === "tb_cluster" || normalized === "t_biroi" || normalized === "vertebrate") {
+        pushVideoLog(`${prettyCameraClass(topDet.class)} logged`, "Logged");
+      }
+    }
+  }
+
+  if (latestAudioAlert && !backendAlertLatched) {
+    pushAudioLog(`${prettyAudioClass(latestAudioClass)} detected`, "High");
+  } else if (latestLogOnly || backendAlertLatched) {
+    pushAudioLog(`${prettyAudioClass(latestAudioClass)} logged`, "Normal");
+  }
+}
+
+function maybeTriggerAIAlert() {
+  if (alertAcknowledged || backendAlertLatched || !backendAlertActive) return;
+
+  let message = "⚠️ HIVE AI ALERT TRIGGERED!";
+  let title = "🚨 HIVE ALERT!";
+
+  const audioClass = normalizeAudioClass(backendTriggerAudioClass || latestAudioClass);
+  const cameraClass = normalizeCameraClass(backendTriggerAudioClass || latestCameraClass);
+  const state = String(latestColonyState || "").toLowerCase();
+
+  if (audioClass === "intruded" || state.includes("intrusion")) {
+    message = "⚠️ INTRUSION DETECTED!";
+    title = "🚨 INTRUSION DETECTED!";
+  } else if (audioClass === "swarming" || state.includes("swarming")) {
+    message = "🐝 SWARMING / READY FOR SPLIT!";
+    title = "🐝 SWARMING DETECTED!";
+  } else if (cameraClass === "person" && backendAlertSource === "video") {
+    message = "🚨 PERSON DETECTED NEAR HIVE!";
+    title = "🚨 PERSON DETECTED!";
+  } else if (cameraClass === "other_insect" && backendAlertSource === "video") {
+    message = "⚠️ OTHER INSECT DETECTED!";
+    title = "⚠️ OTHER INSECT DETECTED!";
+  }
+
+  const alertKey = `${backendAlertSource}|${backendTriggerAudioClass}|${backendTriggeredAt}|${message}`;
+  if (lastAlertKey === alertKey) return;
+  lastAlertKey = alertKey;
+
+  showAcousticAlert(message, title);
+}
+
+function showAcousticAlert(message, title = "🚨 HIVE ALERT!") {
+  if (alertAcknowledged || backendAlertLatched) return;
+
+  const modal = document.getElementById("alert-modal");
+  const notification = document.getElementById("alert-notification");
+  const messageEl = document.getElementById("alert-message");
+  const titleEl = document.getElementById("alert-title");
+  const stateEl = document.getElementById("alert-state-strip-text");
+
+  if (messageEl) messageEl.innerText = message;
+  if (titleEl) titleEl.innerText = title;
+  if (stateEl) stateEl.innerText = "Backend alert active • acknowledge will latch until reset";
+
+  modal?.classList.remove("hidden");
+
+  if (notification) {
+    notification.innerText = message;
+    notification.classList.remove("hidden");
+  }
+
+  if (SETTINGS.audioEnabled) playAlarmSound();
 }
 
 function loadAlertState() {
@@ -1129,92 +1276,145 @@ function loadAlertState() {
 
 function setAlertAcknowledged(value) {
   alertAcknowledged = !!value;
-  if (alertAcknowledged) {
-    localStorage.setItem("hive_alert_acknowledged", "true");
-  } else {
-    localStorage.removeItem("hive_alert_acknowledged");
+  if (alertAcknowledged) localStorage.setItem("hive_alert_acknowledged", "true");
+  else localStorage.removeItem("hive_alert_acknowledged");
+}
+
+async function sendAlertAcknowledge() {
+  try {
+    await apiPost(RPI_ALERT_ACK_URL);
+  } catch (err) {
+    console.warn("Failed to acknowledge backend alert:", err);
   }
 }
 
-function resetAlertState() {
-  setAlertAcknowledged(false);
-  lastAlertKey = "";
+async function sendAlertReset() {
+  try {
+    await apiPost(RPI_ALERT_RESET_URL);
+  } catch (err) {
+    console.warn("Failed to reset backend alert:", err);
+  }
+}
+
+function acknowledgeAlert() {
+  setAlertAcknowledged(true);
+  backendAlertAcknowledged = true;
+  backendAlertLatched = true;
+  backendAlertActive = false;
   document.getElementById("alert-modal")?.classList.add("hidden");
   document.getElementById("alert-notification")?.classList.add("hidden");
   stopAlarmSound();
+  updateResetAlertButtonState();
+  updateBackendStateCards();
+  sendAlertAcknowledge().finally(() => manualRefresh());
 }
 
-function goToLogin() {
-  document.getElementById("landing-view").classList.add("hidden");
-  document.getElementById("login-view").classList.remove("hidden");
-  document.getElementById("mobile-nav-bar").classList.add("hidden");
+function resetAlertState() {
+  lastResetUiTs = Date.now();
+  setAlertAcknowledged(false);
+  lastAlertKey = "";
+  backendAlertAcknowledged = false;
+  backendAlertLatched = false;
+  backendAlertActive = false;
+  document.getElementById("alert-modal")?.classList.add("hidden");
+  document.getElementById("alert-notification")?.classList.add("hidden");
+  stopAlarmSound();
+  updateResetAlertButtonState();
+  sendAlertReset().finally(() => {
+    setTimeout(() => {
+      manualRefresh();
+      updateResetAlertButtonState();
+    }, 500);
+  });
 }
 
-function backToHome() {
-  document.getElementById("login-view").classList.add("hidden");
-  document.getElementById("landing-view").classList.remove("hidden");
+function viewAlertDetails() {
+  document.getElementById("alert-modal")?.classList.add("hidden");
+  switchTab("logs");
 }
 
-function attemptLogin() {
-  const email = document.getElementById("email-input").value.trim().toLowerCase();
-  const password = document.getElementById("password-input").value.trim();
-
-  if (email.endsWith("@gmail.com") && password === "hive123") {
-    localStorage.setItem("hive_isLoggedIn", "true");
-    location.reload();
-  } else {
-    document.getElementById("login-error").classList.remove("hidden");
+function ensureAudioContext() {
+  if (!audioContext) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    audioContext = new Ctx({ latencyHint: "interactive" });
+    audioMasterGain = audioContext.createGain();
+    audioMasterGain.gain.value = 2.5;
+    audioMasterGain.connect(audioContext.destination);
+    audioNextPlayTime = audioContext.currentTime + 0.05;
   }
+  return audioContext;
 }
 
-function logout() {
-  localStorage.removeItem("hive_isLoggedIn");
-  location.reload();
+async function ensureAudioContextRunning() {
+  const ctx = ensureAudioContext();
+  if (ctx.state === "suspended") await ctx.resume();
+  if (!audioMasterGain) {
+    audioMasterGain = ctx.createGain();
+    audioMasterGain.gain.value = 2.5;
+    audioMasterGain.connect(ctx.destination);
+  }
+  return ctx;
 }
 
-function switchTab(tabId) {
-  document.querySelectorAll(".view-section").forEach((sec) => sec.classList.add("hidden"));
-  document.getElementById("view-" + tabId).classList.remove("hidden");
+function playAlarmSound() {
+  if (alarmInterval || alertAcknowledged || backendAlertLatched) return;
 
-  document.querySelectorAll(".nav-menu li, .nav-bottom li, .mobile-nav div").forEach((item) => item.classList.remove("active"));
-  document.querySelectorAll(".nav-item-" + tabId).forEach((item) => item.classList.add("active"));
+  const ctx = ensureAudioContext();
+
+  const playBeep = () => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc.type = "sine";
+    osc.frequency.value = 880;
+    gain.gain.value = 0.05;
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.25);
+    activeOscillators.push(osc);
+  };
+
+  playBeep();
+  alarmInterval = setInterval(() => {
+    if (alertAcknowledged || backendAlertLatched) {
+      stopAlarmSound();
+      return;
+    }
+    playBeep();
+  }, 700);
 }
 
-function stopVideoStream() {
-  const img = document.getElementById("cctv-feed");
-  if (!img) return;
-  img.src = "about:blank";
-  img.removeAttribute("src");
-  img.style.display = "none";
+function stopAlarmSound() {
+  if (alarmInterval) {
+    clearInterval(alarmInterval);
+    alarmInterval = null;
+  }
+
+  activeOscillators.forEach((osc) => {
+    try {
+      osc.stop();
+    } catch { }
+  });
+  activeOscillators = [];
 }
 
-function openVideoModal() {
-  document.getElementById("video-modal").classList.remove("hidden");
+function resampleLinear(input, inRate, outRate) {
+  if (inRate === outRate) return input;
+  const ratio = outRate / inRate;
+  const outLen = Math.max(1, Math.floor(input.length * ratio));
+  const output = new Float32Array(outLen);
 
-  const img = document.getElementById("cctv-feed");
-  if (!img) return;
-
-  img.src = `${RPI_VIDEO_URL}?t=${Date.now()}`;
-  img.style.display = "block";
-
-  const err = document.getElementById("video-error-msg");
-  if (err) err.remove();
-
-  updateVideoModalStatus();
-  populateVideoLogs();
+  for (let i = 0; i < outLen; i++) {
+    const srcIndex = i / ratio;
+    const i0 = Math.floor(srcIndex);
+    const i1 = Math.min(i0 + 1, input.length - 1);
+    const frac = srcIndex - i0;
+    output[i] = input[i0] * (1 - frac) + input[i1] * frac;
+  }
+  return output;
 }
-
-function closeVideoModal() {
-  document.getElementById("video-modal").classList.add("hidden");
-  stopVideoStream();
-  stopAudio();
-}
-
-/**
- * AUDIO CONTROL (HTTP stream)
- * - Keeps toggleAudio/startAudioSocket names for compatibility
- * - Internally uses fetch stream: GET /audio/stream
- */
 
 async function toggleAudio() {
   const statusLabel = document.getElementById("audio-level-label");
@@ -1231,7 +1431,8 @@ async function toggleAudio() {
       }
 
       await ensureAudioContextRunning();
-      startAudioSocket(); // now HTTP streaming
+      audioNextPlayTime = audioContext.currentTime + 0.05;
+      startAudioSocket();
       if (statusLabel) statusLabel.innerText = "Status: Connecting...";
     } else {
       stopAudio();
@@ -1245,14 +1446,9 @@ async function toggleAudio() {
 }
 
 function _scheduleAudioReconnect(reason = "") {
-  if (!audioDesired) return;
-  if (audioStopRequested) return;
-  if (!navigator.onLine) return;
-  if (document.hidden) return;
-  if (audioReconnectTimer) return;
+  if (!audioDesired || audioStopRequested || !navigator.onLine || document.hidden || audioReconnectTimer) return;
 
   const statusLabel = document.getElementById("audio-level-label");
-
   const attempt = Math.max(0, audioReconnectAttempts);
   const base = Math.min(60000, 2000 * Math.pow(2, Math.min(attempt, 6)));
   const jitter = Math.floor(Math.random() * 800);
@@ -1267,57 +1463,76 @@ function _scheduleAudioReconnect(reason = "") {
 
   audioReconnectTimer = setTimeout(() => {
     audioReconnectTimer = null;
-
-    if (!audioDesired || audioStopRequested) return;
-    if (!navigator.onLine || document.hidden) return;
-
-    try {
-      startAudioSocket(); // retry HTTP stream
-    } catch (e) {
-      _scheduleAudioReconnect("retry failed");
-    }
+    if (!audioDesired || audioStopRequested || !navigator.onLine || document.hidden) return;
+    startAudioSocket();
   }, delay);
 }
 
-// Kept name: startAudioSocket(), now uses HTTP stream
 function startAudioSocket() {
   startAudioHttpStream();
 }
 
-// NEW: HTTP streaming implementation
+function getAudioStreamCandidates() {
+  const candidates = [RPI_AUDIO_HTTP_URL, RPI_AUDIO_HTTP_API_URL];
+  if (activeAudioStreamUrl && candidates.includes(activeAudioStreamUrl)) {
+    return [activeAudioStreamUrl, ...candidates.filter((c) => c !== activeAudioStreamUrl)];
+  }
+  return candidates;
+}
+
+async function openAudioHttpResponse(signal) {
+  const candidates = getAudioStreamCandidates();
+  let lastError = null;
+
+  for (const url of candidates) {
+    try {
+      const resp = await apiFetch(url, {
+        method: "GET",
+        cache: "no-store",
+        signal,
+      });
+
+      if (resp.ok && resp.body) {
+        activeAudioStreamUrl = url;
+        return resp;
+      }
+
+      lastError = new Error(`HTTP audio failed: ${resp.status} (${url})`);
+      if (resp.status !== 404 && resp.status !== 405) break;
+    } catch (err) {
+      lastError = err;
+      if (signal.aborted) throw err;
+    }
+  }
+
+  throw lastError || new Error("Unable to open audio stream");
+}
+
 async function startAudioHttpStream() {
   if (audioFetchRunning) return;
 
   const statusLabel = document.getElementById("audio-level-label");
-
   audioFetchRunning = true;
 
   if (audioFetchController) {
     try {
       audioFetchController.abort();
-    } catch (e) {}
+    } catch { }
   }
-  audioFetchController = new AbortController();
 
+  audioFetchController = new AbortController();
   _ensureAudioRing();
+
   isListening = true;
   audioDrawMode = "live";
   updateAudioButtonState(true);
   updateAudioCardStatus("Live", "#2ecc71");
 
-  if (statusLabel) statusLabel.innerText = "Status: Live";
+  if (statusLabel) statusLabel.innerText = "Status: Connecting...";
   pushAudioLog("Live audio (HTTP) connecting", "Normal");
 
   try {
-    const resp = await fetch(RPI_AUDIO_HTTP_URL, {
-      method: "GET",
-      cache: "no-store",
-      signal: audioFetchController.signal,
-    });
-
-    if (!resp.ok || !resp.body) {
-      throw new Error(`HTTP audio failed: ${resp.status}`);
-    }
+    const resp = await openAudioHttpResponse(audioFetchController.signal);
 
     audioReconnectAttempts = 0;
     if (audioReconnectTimer) {
@@ -1326,11 +1541,12 @@ async function startAudioHttpStream() {
     }
 
     pushAudioLog("Live audio (HTTP) connected", "Normal");
+    if (statusLabel) statusLabel.innerText = "Status: Live";
 
-    const reader = resp.body.getReader();
+    audioReader = resp.body.getReader();
 
     while (audioDesired && !audioStopRequested) {
-      const { value, done } = await reader.read();
+      const { value, done } = await audioReader.read();
       if (done) break;
       if (!value || !value.byteLength) continue;
 
@@ -1338,7 +1554,6 @@ async function startAudioHttpStream() {
       playRawAudioBuffer(ab);
     }
 
-    // Stream ended (server closed or network)
     if (audioDesired && !audioStopRequested) {
       pushAudioLog("Live audio (HTTP) ended", "Warning");
       _scheduleAudioReconnect("stream ended");
@@ -1353,14 +1568,33 @@ async function startAudioHttpStream() {
       _scheduleAudioReconnect("http error");
     }
   } finally {
+    if (audioReader) {
+      try {
+        await audioReader.cancel();
+      } catch { }
+      try {
+        audioReader.releaseLock();
+      } catch { }
+      audioReader = null;
+    }
+
     audioFetchRunning = false;
-    if (!audioDesired) isListening = false;
+    if (!audioDesired) {
+      isListening = false;
+      audioDrawMode = "waiting";
+    }
   }
 }
 
 function playRawAudioBuffer(data) {
   const ctx = ensureAudioContext();
-  if (ctx.state === "suspended") ctx.resume();
+  if (ctx.state === "suspended") ctx.resume().catch(() => { });
+
+  if (!audioMasterGain) {
+    audioMasterGain = ctx.createGain();
+    audioMasterGain.gain.value = 2.5;
+    audioMasterGain.connect(ctx.destination);
+  }
 
   const view = new DataView(data);
   const bytesPerSample = 2;
@@ -1418,28 +1652,33 @@ function stopAudio() {
   }
   audioReconnectAttempts = 0;
 
-  // Abort HTTP stream
+  if (audioReader) {
+    try {
+      audioReader.cancel();
+    } catch { }
+    try {
+      audioReader.releaseLock();
+    } catch { }
+    audioReader = null;
+  }
+
   if (audioFetchController) {
     try {
       audioFetchController.abort();
-    } catch (e) {}
+    } catch { }
     audioFetchController = null;
   }
   audioFetchRunning = false;
 
-  // Cleanup legacy WS if ever used
   if (audioPingInterval) {
     clearInterval(audioPingInterval);
     audioPingInterval = null;
   }
+
   if (audioSocket) {
     try {
-      audioSocket.onopen = null;
-      audioSocket.onmessage = null;
-      audioSocket.onerror = null;
-      audioSocket.onclose = null;
       audioSocket.close();
-    } catch (e) {}
+    } catch { }
     audioSocket = null;
   }
 
@@ -1450,6 +1689,10 @@ function stopAudio() {
     audioTag.load();
   }
 
+  const ctx = audioContext;
+  audioNextPlayTime = ctx ? ctx.currentTime + 0.05 : 0;
+
+  _clearAudioRing();
   isListening = false;
   audioDrawMode = "waiting";
   audioWaveData = null;
@@ -1474,8 +1717,8 @@ function setupVideoErrorHandling() {
       err.style.color = "#ff4757";
       err.style.textAlign = "center";
       err.style.marginTop = "20px";
-      err.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Stream Offline. Retrying...`;
-      this.parentElement.appendChild(err);
+      err.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Camera not ready. Waiting / retrying...`;
+      this.parentElement?.appendChild(err);
     }
 
     setTimeout(() => {
@@ -1493,13 +1736,68 @@ function setupVideoErrorHandling() {
   };
 }
 
+async function notifyVideoOpen() {
+  try {
+    await apiPost(RPI_VIDEO_OPEN_URL);
+  } catch (err) {
+    console.warn("Failed to notify backend video open:", err);
+  }
+}
+
+async function notifyVideoClose() {
+  try {
+    await apiPost(RPI_VIDEO_CLOSE_URL);
+  } catch (err) {
+    console.warn("Failed to notify backend video close:", err);
+  }
+}
+
+function stopVideoStream() {
+  const img = document.getElementById("cctv-feed");
+  if (!img) return;
+  img.src = "about:blank";
+  img.removeAttribute("src");
+  img.style.display = "none";
+}
+
+async function openVideoModal() {
+  document.getElementById("video-modal")?.classList.remove("hidden");
+  updateCameraBadge("Opening...", "");
+  updateCameraCardStatus("Opening...", "#f7b731");
+
+  await notifyVideoOpen();
+
+  const img = document.getElementById("cctv-feed");
+  if (!img) return;
+
+  img.src = `${RPI_VIDEO_URL}?t=${Date.now()}`;
+  img.style.display = "block";
+
+  const err = document.getElementById("video-error-msg");
+  if (err) err.remove();
+
+  updateVideoModalStatus();
+  populateVideoLogs();
+  updateData();
+}
+
+async function closeVideoModal() {
+  document.getElementById("video-modal")?.classList.add("hidden");
+  stopVideoStream();
+  stopAudio();
+  await notifyVideoClose();
+  updateData();
+}
+
 function openAudioModal() {
   const modal = document.getElementById("audio-modal");
   if (!modal) return;
 
   modal.classList.remove("hidden");
+  applyAudioSettingsToModal();
   populateAudioLogs();
   updateAudioModalStatus();
+  updateAudioParamLabels();
 
   if (specAnimationId) cancelAnimationFrame(specAnimationId);
   setTimeout(() => {
@@ -1517,35 +1815,6 @@ function closeAudioModal() {
   stopAudio();
 }
 
-function populateAudioLogs() {
-  const container = document.getElementById("audio-events-list");
-  if (!container) return;
-
-  container.innerHTML = "";
-
-  if (!audioLogs || audioLogs.length === 0) {
-    container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 20px;">No audio events recorded</div>';
-    return;
-  }
-
-  audioLogs.forEach((log) => {
-    const div = document.createElement("div");
-    div.className = "audio-event-item";
-    div.innerHTML = `
-      <div class="timestamp">${log.timestamp}</div>
-      <div class="event-type">
-        <span>${log.eventType}</span>
-        <span class="stress-indicator ${log.stressLevel === "Normal" ? "stress-normal" : "stress-high"}">${log.stressLevel}</span>
-      </div>
-    `;
-    container.appendChild(div);
-  });
-}
-
-// --- everything below remains same as your original file ---
-// animateSpectrogram(), alerts, links, DOMContentLoaded, profile/log deletes
-// (unchanged from your uploaded script)
-
 function animateSpectrogram(canvas) {
   if (!canvas || !canvas.parentElement) return;
 
@@ -1556,6 +1825,7 @@ function animateSpectrogram(canvas) {
 
   WAVE_VIEW_SECONDS = Math.min(Math.max(5.0 / zoomX, 0.25), AUDIO_RING_SECONDS);
   WAVE_GAIN = Math.min(Math.max(zoomY, 0.25), 10.0);
+  updateAudioParamLabels();
 
   const rect = canvas.parentElement.getBoundingClientRect();
   const width = Math.max(320, Math.floor(rect.width || 640));
@@ -1567,7 +1837,6 @@ function animateSpectrogram(canvas) {
   }
 
   const ctx = canvas.getContext("2d");
-
   const padL = AUDIO_VIZ.showAxes ? 60 : 12;
   const padR = 12;
   const padT = 12;
@@ -1575,14 +1844,13 @@ function animateSpectrogram(canvas) {
 
   const plotW = Math.max(10, width - padL - padR);
   const plotH = Math.max(10, height - padT - padB);
-
   const x0 = padL;
   const y0 = padT;
   const x1 = padL + plotW;
   const y1 = padT + plotH;
 
   ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#000000";
+  ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, width, height);
 
   ctx.save();
@@ -1628,22 +1896,19 @@ function animateSpectrogram(canvas) {
     ctx.fillStyle = "rgba(90, 160, 255, 0.25)";
 
     const midY = y0 + plotH / 2;
-
     ctx.beginPath();
     let peak = 0;
 
     for (let px = 0; px < plotW; px++) {
       const baseOffset = px * samplesPerPixel;
-      let localMin = 1,
-        localMax = -1;
+      let localMin = 1;
+      let localMax = -1;
 
       for (let k = 0; k < samplesPerPixel; k++) {
         const offset = baseOffset + k;
         if (offset >= viewSamples) break;
-
         let idx = startIdx + offset;
         if (idx >= cap) idx -= cap;
-
         const s = audioRing[idx] * WAVE_GAIN;
         if (s > localMax) localMax = s;
         if (s < localMin) localMin = s;
@@ -1651,28 +1916,24 @@ function animateSpectrogram(canvas) {
 
       localMax = Math.max(-1, Math.min(1, localMax));
       localMin = Math.max(-1, Math.min(1, localMin));
-
       peak = Math.max(peak, Math.abs(localMax), Math.abs(localMin));
 
       const x = x0 + px;
       const yUpper = midY - localMax * (plotH * 0.48);
-
       if (px === 0) ctx.moveTo(x, yUpper);
       else ctx.lineTo(x, yUpper);
     }
 
     for (let px = plotW - 1; px >= 0; px--) {
       const baseOffset = px * samplesPerPixel;
-      let localMin = 1,
-        localMax = -1;
+      let localMin = 1;
+      let localMax = -1;
 
       for (let k = 0; k < samplesPerPixel; k++) {
         const offset = baseOffset + k;
         if (offset >= viewSamples) break;
-
         let idx = startIdx + offset;
         if (idx >= cap) idx -= cap;
-
         const s = audioRing[idx] * WAVE_GAIN;
         if (s > localMax) localMax = s;
         if (s < localMin) localMin = s;
@@ -1683,7 +1944,6 @@ function animateSpectrogram(canvas) {
 
       const x = x0 + px;
       const yLower = midY - localMin * (plotH * 0.48);
-
       ctx.lineTo(x, yLower);
     }
 
@@ -1721,243 +1981,109 @@ function animateSpectrogram(canvas) {
     ctx.lineTo(x1, y1);
     ctx.stroke();
 
-    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.fillStyle = "rgba(255,255,255,0.65)";
     ctx.font = "11px Roboto Mono, monospace";
-
-    const yTicks = [-1, -0.5, 0, 0.5, 1];
-    for (const t of yTicks) {
-      const yy = y0 + plotH / 2 - (t * plotH) / 2;
-
-      ctx.strokeStyle = "rgba(255,255,255,0.25)";
-      ctx.beginPath();
-      ctx.moveTo(x0 - 5, yy);
-      ctx.lineTo(x0, yy);
-      ctx.stroke();
-
-      ctx.fillStyle = "rgba(255,255,255,0.70)";
-      ctx.fillText(t.toFixed(1), 10, yy + 4);
-    }
-
-    const totalSec = WAVE_VIEW_SECONDS;
-    const tickCount = 6;
-    for (let i = 0; i < tickCount; i++) {
-      const frac = i / (tickCount - 1);
-      const xx = x0 + frac * plotW;
-      const sec = frac * totalSec;
-
-      ctx.strokeStyle = "rgba(255,255,255,0.25)";
-      ctx.beginPath();
-      ctx.moveTo(xx, y1);
-      ctx.lineTo(xx, y1 + 5);
-      ctx.stroke();
-
-      ctx.fillStyle = "rgba(255,255,255,0.70)";
-      ctx.fillText(`${sec.toFixed(2)}s`, xx - 14, y1 + 18);
-    }
-
-    ctx.fillStyle = "rgba(255,255,255,0.75)";
-    ctx.font = "12px Poppins, sans-serif";
-    ctx.fillText("Time (s)", x0 + plotW / 2 - 28, height - 10);
-
-    ctx.save();
-    ctx.translate(18, y0 + plotH / 2 + 28);
-    ctx.rotate(-Math.PI / 2);
-    ctx.fillText("Amplitude", 0, 0);
-    ctx.restore();
+    ctx.fillText("Amp", 18, y0 + 10);
+    ctx.fillText(`${WAVE_VIEW_SECONDS.toFixed(1)}s`, x1 - 42, y1 + 18);
   }
 
   specAnimationId = requestAnimationFrame(() => animateSpectrogram(canvas));
 }
 
-function closeAlertModal() {
-  setAlertAcknowledged(true);
-  document.getElementById("alert-modal")?.classList.add("hidden");
-  document.getElementById("alert-notification")?.classList.add("hidden");
-  stopAlarmSound();
+function startDataUpdates() {
+  if (updateIntervalId) clearInterval(updateIntervalId);
+  const rate = SETTINGS.refreshRate || 2000;
+  updateIntervalId = setInterval(updateData, rate);
 }
 
-function viewAudioLogs() {
-  closeAlertModal();
-  openAudioModal();
-}
+function manualRefresh() {
+  const icon = document.querySelector(".refresh-btn-global i");
+  if (icon) icon.classList.add("fa-spin");
 
-function showAcousticAlert(message, title = "🚨 HIVE ALERT!") {
-  const notif = document.getElementById("alert-notification");
-  const modal = document.getElementById("alert-modal");
-  const msg = document.getElementById("alert-modal-message");
-  const ts = document.getElementById("alert-timestamp");
-  const alertMessage = document.getElementById("alert-message");
-  const alertTitle = document.getElementById("alert-modal-title");
-
-  if (alertAcknowledged) {
-    if (notif) notif.classList.add("hidden");
-    if (modal) modal.classList.add("hidden");
-    stopAlarmSound();
-    return;
-  }
-
-  if (notif) notif.classList.remove("hidden");
-  if (modal) modal.classList.remove("hidden");
-  if (msg) msg.innerText = message;
-  if (ts) ts.innerText = `⏰ ${new Date().toLocaleTimeString()}`;
-  if (alertMessage) alertMessage.innerText = message;
-  if (alertTitle) alertTitle.innerText = title;
-
-  if (SETTINGS.audioEnabled) playAlarmSound();
-}
-
-function playAlarmSound() {
-  if (alarmInterval) return;
-
-  const playPulse = () => {
-    try {
-      const ac = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = ac.createOscillator();
-      const g = ac.createGain();
-
-      osc.connect(g);
-      g.connect(ac.destination);
-
-      osc.frequency.value = 800;
-      g.gain.setValueAtTime(0.3, ac.currentTime);
-
-      osc.start();
-      osc.stop(ac.currentTime + 0.2);
-
-      activeOscillators.push(osc);
-      setTimeout(() => {
-        activeOscillators = [];
-      }, 300);
-    } catch (e) {}
-  };
-
-  playPulse();
-  alarmInterval = setInterval(playPulse, 1000);
-}
-
-function stopAlarmSound() {
-  if (alarmInterval) {
-    clearInterval(alarmInterval);
-    alarmInterval = null;
-  }
-
-  activeOscillators.forEach((osc) => {
-    try {
-      osc.stop();
-    } catch (e) {}
+  updateData().finally(() => {
+    setTimeout(() => {
+      if (icon) icon.classList.remove("fa-spin");
+    }, 700);
   });
-  activeOscillators = [];
 }
 
-function openLinksModal(key) {
-  const data = BEE_RESOURCES[key];
-  if (!data) return;
-
-  document.getElementById("links-modal-title").innerText = data.title;
-  const list = document.getElementById("links-list-container");
-  list.innerHTML = "";
-
-  data.links.forEach((l) => {
-    const a = document.createElement("a");
-    a.href = l.url;
-    a.target = "_blank";
-    a.className = "resource-item";
-    a.innerHTML = `<div class="res-info"><h4>${l.name}</h4><p>Click to view</p></div><i class="${l.icon} res-icon"></i>`;
-    list.appendChild(a);
-  });
-
-  document.getElementById("links-modal").classList.remove("hidden");
+function toggleDashboardMenu() {
+  document.getElementById("dashboard-mobile-dropdown")?.classList.toggle("hidden");
 }
 
-function closeLinksModal() {
-  document.getElementById("links-modal").classList.add("hidden");
+function switchTab(tabId) {
+  document.querySelectorAll(".view-section").forEach((sec) => sec.classList.add("hidden"));
+  document.getElementById(`view-${tabId}`)?.classList.remove("hidden");
+
+  document.querySelectorAll(".nav-menu li, .nav-bottom li, .mobile-nav div").forEach((item) => item.classList.remove("active"));
+  document.querySelectorAll(`.nav-item-${tabId}`).forEach((item) => item.classList.add("active"));
 }
 
-function previewImage(input) {
-  if (input.files && input.files[0]) {
-    const reader = new FileReader();
-    reader.onload = function (e) {
-      document.getElementById("avatar-preview").src = e.target.result;
-    };
-    reader.readAsDataURL(input.files[0]);
-  }
-}
-
-function openSensorModal() {}
-function closeSensorModal() {
-  document.getElementById("sensor-modal").classList.add("hidden");
+function reloadDashboard() {
+  location.reload();
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  const landingSwarm = document.getElementById("landing-swarm");
-  if (landingSwarm) createSwarm(landingSwarm, "landing-bee", 30);
-
   const dashboardSwarm = document.getElementById("dashboard-swarm");
   if (dashboardSwarm) createSwarm(dashboardSwarm, "dashboard-bee", 20);
 
-  const bee = document.getElementById("bee-tracker");
-  if (bee) {
-    document.addEventListener("mousemove", (e) => {
-      const x = (window.innerWidth - e.pageX) / 25;
-      const y = (window.innerHeight - e.pageY) / 25;
-      bee.style.transform = `translateX(${x}px) translateY(${y}px)`;
-    });
-  }
-
   loadSettings();
   loadAlertState();
+  loadProfile();
+  initChart();
+  startDataUpdates();
+  updateCamTime();
+  setInterval(updateCamTime, 1000);
+  setupVideoErrorHandling();
+  switchTab("dashboard");
+  applyAudioSettingsToModal();
+  updateAudioParamLabels();
+  updateBackendStateCards();
+  updateResetAlertButtonState();
   updateAudioButtonState(false);
   updateAudioCardStatus("Normal", "#2ecc71");
-  updateAudioBadge("Listening");
-  updateCameraCardStatus("Bee", "#2ecc71");
-  updateCameraBadge("● Live", "blink-red");
+  updateAudioBadge("Ready");
+  updateCameraCardStatus("Idle", "#95a5a6");
+  updateCameraBadge("Watching");
+  populateVideoLogs();
+  populateAudioLogs();
   updateAudioModalStatus();
   updateVideoModalStatus();
-  populateVideoLogs();
+  updateData();
 
-  const zoomX = document.getElementById("audio-zoom-x");
-  const zoomY = document.getElementById("audio-zoom-y");
-  if (zoomX) zoomX.addEventListener("input", _readAudioVizFromUI);
-  if (zoomY) zoomY.addEventListener("input", _readAudioVizFromUI);
+  const listeners = [
+    "audio-zoom-x",
+    "audio-zoom-y",
+    "audio-show-axes",
+    "audio-show-grid",
+  ];
 
-  if (localStorage.getItem("hive_isLoggedIn") === "true") {
-    document.getElementById("landing-view").classList.add("hidden");
-    document.getElementById("dashboard-view").classList.remove("hidden");
-    document.getElementById("mobile-nav-bar").classList.remove("hidden");
+  listeners.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("input", () => {
+      _readAudioVizFromUI();
+      updateAudioParamLabels();
+    });
+    if (el) el.addEventListener("change", () => {
+      _readAudioVizFromUI();
+      updateAudioParamLabels();
+    });
+  });
 
-    loadProfile();
-    initChart();
-    startDataUpdates();
-    setInterval(updateCamTime, 1000);
-    updateData();
-    setupVideoErrorHandling();
-  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      if (audioDesired) stopAudio();
+      stopAlarmSound();
+    }
+  });
+
+  window.addEventListener("online", () => {
+    if (audioDesired && !audioFetchRunning) startAudioSocket();
+  });
 
   window.addEventListener("beforeunload", () => {
     stopAudio();
+    stopAlarmSound();
     stopVideoStream();
   });
 });
-
-function saveProfile() {
-  const updatedProfile = {
-    name: document.getElementById("edit-name").value || "Glenda",
-    role: document.getElementById("edit-role").value || "4th Year ECE Student",
-    credentials: document.getElementById("edit-credentials").value || "Authorized Personnel",
-    avatar: document.getElementById("avatar-preview").src,
-  };
-
-  localStorage.setItem("hive_profile", JSON.stringify(updatedProfile));
-  loadProfile();
-  alert("✅ Changes Saved! Profile updated across the dashboard.");
-}
-
-function deleteVideoLogs() {
-  videoLogs = [];
-  populateVideoLogs();
-}
-
-function deleteAudioLogs() {
-  audioLogs = [];
-  populateAudioLogs();
-}
