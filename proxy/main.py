@@ -26,7 +26,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 DEFAULT_PI_HTTP_BASE = os.getenv("PI_HTTP_BASE", "").strip().rstrip("/")
 PI_API_TOKEN = os.getenv("PI_API_TOKEN", "").strip()
 RPI_EVENT_TOKEN = os.getenv("RPI_EVENT_TOKEN", "").strip()
-DB_URL = os.getenv("DB_URL", "").strip()
+DB_URL = os.getenv("DB_URL", os.getenv("DATABASE_URL", "")).strip()
 
 PI_HTTP_BASE_RUNTIME = DEFAULT_PI_HTTP_BASE
 
@@ -42,8 +42,8 @@ class EventLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     device_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="rpi")
-    kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)  # audio|video
-    event: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # intruded|stress_buzz|swarming
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    event: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     conf: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, default=datetime.utcnow, index=True)
@@ -241,18 +241,8 @@ async def _forward_get(path: str, timeout_s: float = 12.0) -> Response:
     return Response(
         content=r.content,
         status_code=r.status_code,
-        media_type=r.headers.get("content-type", "application/json"),
+        media_type=r.headers.get("content-type", "application/octet-stream"),
     )
-
-
-@app.get("/api/latest")
-async def api_latest() -> Response:
-    return await _forward_get("/api/latest")
-
-
-@app.get("/api/sensors")
-async def api_sensors() -> Response:
-    return await _forward_get("/api/sensors")
 
 
 async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
@@ -267,12 +257,36 @@ async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
                     yield chunk
 
 
+@app.get("/api/latest")
+async def api_latest() -> Response:
+    return await _forward_get("/api/latest")
+
+
+@app.get("/api/sensors")
+async def api_sensors() -> Response:
+    return await _forward_get("/api/sensors")
+
+
 @app.get("/video.mjpg")
 async def video_mjpg() -> StreamingResponse:
     url = f"{_pi_http_base()}/video.mjpg"
     return StreamingResponse(
         _stream_upstream(url),
         media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/audio")
+async def audio_http() -> Response:
+    return await _forward_get("/audio", timeout_s=60.0)
+
+
+@app.get("/audio/stream")
+async def audio_stream() -> StreamingResponse:
+    url = f"{_pi_http_base()}/audio/stream"
+    return StreamingResponse(
+        _stream_upstream(url),
+        media_type="audio/mpeg",
     )
 
 
@@ -376,14 +390,9 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
         await ws.accept()
         await ws.send_text(f"WS proxy config error: {type(e).__name__}: {e}")
         await _safe_close_ws(ws, code=1011, reason="WS proxy config error")
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to establish upstream websocket")
-        await _safe_close_ws(ws, code=1011, reason=f"Upstream connection failed: {type(e).__name__}")
-
-
-@app.websocket("/ws/audio")
-async def ws_audio(ws: WebSocket) -> None:
-    await _ws_passthrough(ws, "/ws/audio")
+        await _safe_close_ws(ws, code=1011, reason="Upstream connection failed")
 
 
 @app.websocket("/ws/sensors")
