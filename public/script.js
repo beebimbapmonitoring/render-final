@@ -6,19 +6,24 @@ const CONFIG = {
   weight: 14.5,
 };
 
-const CONFIG_BASE =
-  (window.BEEROI_CONFIG && String(window.BEEROI_CONFIG.PROXY_BASE_URL || "").trim()) || "";
+function normalizeBaseUrl(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
 
-const FUNNEL_ORIGIN =
-  (window.__HIVE_FUNNEL_ORIGIN && String(window.__HIVE_FUNNEL_ORIGIN).trim()) ||
-  (localStorage.getItem("hive_funnel_origin") || "").trim();
+const CONFIG_BASE = normalizeBaseUrl(
+  window.BEEROI_CONFIG && window.BEEROI_CONFIG.PROXY_BASE_URL
+);
 
-const HTTP_ORIGIN = CONFIG_BASE || window.location.origin || FUNNEL_ORIGIN;
+const FUNNEL_ORIGIN = normalizeBaseUrl(
+  window.__HIVE_FUNNEL_ORIGIN || localStorage.getItem("hive_funnel_origin") || ""
+);
 
-const WS_ORIGIN = (CONFIG_BASE || window.location.origin)
-  ? String(CONFIG_BASE || window.location.origin)
-    .replace(/^https:\/\//, "wss://")
-    .replace(/^http:\/\//, "ws://")
+const SAME_ORIGIN = normalizeBaseUrl(window.location.origin || "");
+
+const HTTP_ORIGIN = CONFIG_BASE || FUNNEL_ORIGIN || SAME_ORIGIN;
+
+const WS_ORIGIN = HTTP_ORIGIN
+  ? HTTP_ORIGIN.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://")
   : (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host;
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
@@ -1395,7 +1400,7 @@ function stopAlarmSound() {
   activeOscillators.forEach((osc) => {
     try {
       osc.stop();
-    } catch { }
+    } catch {}
   });
   activeOscillators = [];
 }
@@ -1517,7 +1522,7 @@ async function startAudioHttpStream() {
   if (audioFetchController) {
     try {
       audioFetchController.abort();
-    } catch { }
+    } catch {}
   }
 
   audioFetchController = new AbortController();
@@ -1571,10 +1576,10 @@ async function startAudioHttpStream() {
     if (audioReader) {
       try {
         await audioReader.cancel();
-      } catch { }
+      } catch {}
       try {
         audioReader.releaseLock();
-      } catch { }
+      } catch {}
       audioReader = null;
     }
 
@@ -1588,7 +1593,7 @@ async function startAudioHttpStream() {
 
 function playRawAudioBuffer(data) {
   const ctx = ensureAudioContext();
-  if (ctx.state === "suspended") ctx.resume().catch(() => { });
+  if (ctx.state === "suspended") ctx.resume().catch(() => {});
 
   if (!audioMasterGain) {
     audioMasterGain = ctx.createGain();
@@ -1655,17 +1660,17 @@ function stopAudio() {
   if (audioReader) {
     try {
       audioReader.cancel();
-    } catch { }
+    } catch {}
     try {
       audioReader.releaseLock();
-    } catch { }
+    } catch {}
     audioReader = null;
   }
 
   if (audioFetchController) {
     try {
       audioFetchController.abort();
-    } catch { }
+    } catch {}
     audioFetchController = null;
   }
   audioFetchRunning = false;
@@ -1678,7 +1683,7 @@ function stopAudio() {
   if (audioSocket) {
     try {
       audioSocket.close();
-    } catch { }
+    } catch {}
     audioSocket = null;
   }
 
