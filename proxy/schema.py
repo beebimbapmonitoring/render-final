@@ -1,27 +1,24 @@
-# app/schemas.py
+# proxy/schema.py
 from __future__ import annotations
 
-from pydantic import BaseModel
-from typing import Optional, Any, Dict
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
 
 
-class SensorCreate(BaseModel):
-    temp_c: Optional[float] = None
-    hum_pct: Optional[float] = None
-    weight_kg: Optional[float] = None
-    source: str = "rpi"
+class EventIn(BaseModel):
+    device_id: str = Field(default="rpi", max_length=64)
+    kind: str = Field(..., max_length=16)
+    event: str = Field(..., max_length=64)
+    conf: float = 0.0
+    payload: Optional[dict[str, Any]] = None
 
 
-class AiEventCreate(BaseModel):
-    kind: str  # audio/video/system
-    top_class: str
-    top_conf: float = 0.0
-    alert: bool = False
-    log_only: bool = False
-    payload: Optional[Dict[str, Any]] = None
-
-
-class SystemEventCreate(BaseModel):
-    level: str = "info"
-    message: str
-    meta: Optional[Dict[str, Any]] = None
+class EventOut(BaseModel):
+    id: int
+    device_id: str
+    kind: str
+    event: str
+    conf: float
+    payload: Optional[dict[str, Any]] = None
+    created_at: Optional[str] = None
