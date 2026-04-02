@@ -17,9 +17,9 @@ from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from crud import create_event, list_events as crud_list_events
-from .db import Base, engine, get_db
-from .models import EventLog
-from .schema import EventIn
+from db import Base, engine, get_db
+from models import EventLog
+from schema import EventIn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("render-proxy")
