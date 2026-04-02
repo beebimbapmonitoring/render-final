@@ -7,8 +7,8 @@ from typing import Optional
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from .models import EventLog
-from .schema import EventIn
+from models import EventLog
+from schema import EventIn
 
 
 def create_event(db: Session, payload: EventIn) -> EventLog:
