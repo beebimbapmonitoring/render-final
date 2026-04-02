@@ -1,11 +1,10 @@
-# proxy/main.py
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import os
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -32,7 +31,6 @@ RPI_EVENT_TOKEN = os.getenv("RPI_EVENT_TOKEN", "").strip()
 PI_HTTP_BASE_RUNTIME = DEFAULT_PI_HTTP_BASE
 
 app = FastAPI(title="Hive Render Proxy")
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -105,6 +103,16 @@ def _require_rpi_event_token(x_rpi_token: str | None) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+@app.get("/__routes")
+async def debug_routes() -> dict[str, list[dict[str, Any]]]:
+    routes = []
+    for route in app.router.routes:
+        path = getattr(route, "path", str(route))
+        methods = sorted(getattr(route, "methods", []) or [])
+        routes.append({"path": path, "methods": methods})
+    return {"routes": routes}
+
+
 @app.get("/health")
 async def health(db: Session = Depends(get_db)) -> dict:
     db_ok = False
@@ -162,6 +170,18 @@ async def _forward_get(path: str, timeout_s: float = 12.0) -> Response:
     )
 
 
+async def _forward_post(path: str, payload: Any = None, timeout_s: float = 12.0) -> Response:
+    url = f"{_pi_http_base()}/{path.lstrip('/')}"
+    async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
+        response = await client.post(url, json=payload, headers=_auth_headers())
+
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        media_type=response.headers.get("content-type", "application/json"),
+    )
+
+
 async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
     timeout = httpx.Timeout(connect=12, read=None, write=12, pool=12)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
@@ -194,6 +214,68 @@ async def video_mjpg() -> StreamingResponse:
 @app.get("/audio")
 async def audio_http() -> Response:
     return await _forward_get("/audio", timeout_s=60.0)
+
+
+@app.get("/audio/stream")
+async def audio_stream() -> StreamingResponse:
+    url = f"{_pi_http_base()}/audio/stream"
+    return StreamingResponse(
+        _stream_upstream(url),
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/audio/stream/")
+async def audio_stream_slash() -> StreamingResponse:
+    return await audio_stream()
+
+
+@app.get("/api/audio/stream")
+async def api_audio_stream() -> StreamingResponse:
+    url = f"{_pi_http_base()}/api/audio/stream"
+    return StreamingResponse(
+        _stream_upstream(url),
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/audio/stream/")
+async def api_audio_stream_slash() -> StreamingResponse:
+    return await api_audio_stream()
+
+
+@app.post("/api/video/open")
+async def api_video_open() -> Response:
+    return await _forward_post("/api/video/open")
+
+
+@app.post("/api/video/close")
+async def api_video_close() -> Response:
+    return await _forward_post("/api/video/close")
+
+
+@app.post("/api/alert/ack")
+async def api_alert_ack() -> Response:
+    return await _forward_post("/api/alert/ack")
+
+
+@app.post("/api/alert/reset")
+async def api_alert_reset() -> Response:
+    return await _forward_post("/api/alert/reset")
 
 
 def _build_upstream_ws_url(ws: WebSocket, upstream_path: str) -> str:
