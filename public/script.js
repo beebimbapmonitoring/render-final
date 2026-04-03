@@ -27,6 +27,7 @@ const WS_ORIGIN = HTTP_ORIGIN
   : (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host;
 
 const RPI_URL = `${HTTP_ORIGIN}/api/latest`;
+const RPI_LATENCY_URL = `${HTTP_ORIGIN}/api/debug/latency`;
 const RPI_AUDIO_WS_URL = `${WS_ORIGIN}/ws/audio`;
 const RPI_AUDIO_HTTP_URL = `${HTTP_ORIGIN}/audio/stream`;
 const RPI_AUDIO_HTTP_API_URL = `${HTTP_ORIGIN}/api/audio/stream`;
@@ -211,6 +212,34 @@ const DEFAULT_PROFILE = {
   avatar: "https://api.dicebear.com/7.x/avataaars/svg?seed=Felix",
 };
 
+let latestStreamMetrics = {
+  audio: null,
+  video: null,
+  api: null,
+  server_ts: 0,
+};
+
+let latestFrontendLatency = {
+  latestFetchMs: 0,
+  latencyFetchMs: 0,
+  videoBrowserLoadMs: 0,
+  audioApproxBrowserDelayMs: 0,
+};
+
+let lastVideoRequestStartedAt = 0;
+let lastVideoLoadedAt = 0;
+let lastLatencyConsoleAt = 0;
+
+function roundMetric(value, digits = 2) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Number(n.toFixed(digits));
+}
+
+function nowSeconds() {
+  return Date.now() / 1000;
+}
+
 function formatClock(dateObj = new Date(), withSeconds = false) {
   const options = SETTINGS.use24h
     ? { hour: "2-digit", minute: "2-digit", ...(withSeconds ? { second: "2-digit" } : {}), hour12: false }
@@ -374,6 +403,91 @@ function applyAudioStreamConfig(config = {}) {
 
   _ensureAudioRing();
   updateAudioParamLabels();
+}
+
+function summarizeLatencyMetrics() {
+  const audio = latestStreamMetrics.audio || {};
+  const video = latestStreamMetrics.video || {};
+  const api = latestStreamMetrics.api || {};
+
+  const audioServerToBrowserMs = audio.last_ws_send_ts
+    ? roundMetric((nowSeconds() - Number(audio.last_ws_send_ts)) * 1000, 2)
+    : audio.last_http_send_ts
+      ? roundMetric((nowSeconds() - Number(audio.last_http_send_ts)) * 1000, 2)
+      : 0;
+
+  const videoServerToBrowserMs = video.last_stream_send_ts
+    ? roundMetric((nowSeconds() - Number(video.last_stream_send_ts)) * 1000, 2)
+    : 0;
+
+  return {
+    frontend: {
+      latestFetchMs: latestFrontendLatency.latestFetchMs,
+      latencyFetchMs: latestFrontendLatency.latencyFetchMs,
+      videoBrowserLoadMs: latestFrontendLatency.videoBrowserLoadMs,
+      audioApproxBrowserDelayMs: latestFrontendLatency.audioApproxBrowserDelayMs,
+    },
+    backend: {
+      latestApiProcessingMs: roundMetric(api.last_latest_processing_ms || 0, 3),
+      latencyApiProcessingMs: roundMetric(api.last_latency_processing_ms || 0, 3),
+      audioChunksTotal: Number(audio.chunks_total || 0),
+      audioLastChunkSeq: Number(audio.last_chunk_seq || 0),
+      audioLastChunkBytes: Number(audio.last_chunk_bytes || 0),
+      audioLastInterChunkMs: roundMetric(audio.last_inter_chunk_ms || 0, 3),
+      audioAvgInterChunkMs: roundMetric(audio.avg_inter_chunk_ms || 0, 3),
+      audioWsClients: Number(audio.ws_clients || 0),
+      audioHttpClients: Number(audio.http_clients || 0),
+      audioServerToBrowserMs,
+      videoFramesTotal: Number(video.frames_total || 0),
+      videoLastFrameSeq: Number(video.last_frame_seq || 0),
+      videoLastFrameBytes: Number(video.last_frame_bytes || 0),
+      videoLastInterFrameMs: roundMetric(video.last_inter_frame_ms || 0, 3),
+      videoAvgInterFrameMs: roundMetric(video.avg_inter_frame_ms || 0, 3),
+      videoApproxFps: roundMetric(video.approx_fps || 0, 3),
+      videoClients: Number(video.clients || 0),
+      videoBackend: String(video.backend || "--"),
+      videoServerToBrowserMs,
+    },
+  };
+}
+
+function logLatencyMetricsToConsole(force = false) {
+  const now = Date.now();
+  if (!force && now - lastLatencyConsoleAt < 3000) return;
+  lastLatencyConsoleAt = now;
+  console.log("[Hive Latency Metrics]", summarizeLatencyMetrics());
+}
+
+async function fetchStreamMetrics() {
+  const started = performance.now();
+
+  try {
+    const response = await apiFetch(RPI_LATENCY_URL, {
+      cache: "no-store",
+    });
+
+    const ended = performance.now();
+    latestFrontendLatency.latencyFetchMs = roundMetric(ended - started, 2);
+
+    if (!response.ok) {
+      throw new Error(`Latency endpoint error: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    latestStreamMetrics = {
+      audio: data.audio || null,
+      video: data.video || null,
+      api: data.api || null,
+      server_ts: Number(data.server_ts || 0),
+    };
+
+    logLatencyMetricsToConsole(false);
+    return data;
+  } catch (error) {
+    console.warn("Failed to fetch stream metrics:", error);
+    return null;
+  }
 }
 
 function loadSettings() {
@@ -1169,15 +1283,27 @@ async function updateData() {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
+    const fetchStarted = performance.now();
     const response = await apiFetch(RPI_URL, {
       signal: controller.signal,
       cache: "no-store",
     });
+    const fetchEnded = performance.now();
+    latestFrontendLatency.latestFetchMs = roundMetric(fetchEnded - fetchStarted, 2);
 
     clearTimeout(timeoutId);
     if (!response.ok) throw new Error(`RPi Error: ${response.status}`);
 
     const data = await response.json();
+
+    if (data.stream_metrics) {
+      latestStreamMetrics = {
+        audio: data.stream_metrics.audio || null,
+        video: data.stream_metrics.video || null,
+        api: data.stream_metrics.api || null,
+        server_ts: Number(data.stream_metrics.server_ts || 0),
+      };
+    }
 
     const extracted = _extractTempHumWeight(data);
     t = extracted.temp !== null ? parseFloat(extracted.temp).toFixed(1) : "--";
@@ -1221,6 +1347,8 @@ async function updateData() {
   } finally {
     isFetchingLatest = false;
   }
+
+  fetchStreamMetrics().catch(() => { });
 
   let netW = 0;
   let displayW = "--";
@@ -1368,6 +1496,8 @@ async function updateData() {
   } else if (latestLogOnly || backendAlertLatched) {
     pushAudioLog(`${prettyAudioClass(latestAudioClass)} logged`, "Normal");
   }
+
+  logLatencyMetricsToConsole(false);
 }
 
 function maybeTriggerAIAlert() {
@@ -1676,6 +1806,7 @@ function startAudioSocket() {
     audioWsConnected = true;
     if (statusLabel) statusLabel.innerText = "Status: Live (WS)";
     pushAudioLog("Live audio (WS) connected", "Normal");
+    fetchStreamMetrics().catch(() => { });
 
     audioPingInterval = setInterval(() => {
       if (!audioSocket || audioSocket.readyState !== WebSocket.OPEN) return;
@@ -1914,8 +2045,18 @@ function playRawAudioBuffer(data) {
 
   const bufferedMs = Math.round((audioQueuedBytes / getAudioBytesPerSecond()) * 1000);
   const statusLabel = document.getElementById("audio-level-label");
+
+  const audioMetrics = latestStreamMetrics.audio || {};
+  const audioSendTs = Number(audioMetrics.last_ws_send_ts || audioMetrics.last_http_send_ts || 0);
+
+  latestFrontendLatency.audioApproxBrowserDelayMs = audioSendTs
+    ? roundMetric((nowSeconds() - audioSendTs) * 1000, 2)
+    : 0;
+
   if (statusLabel) {
-    statusLabel.innerText = `Status: Live (WS) • ${inRate} Hz • Buffer ${bufferedMs}ms • Level ${(peak * 100).toFixed(0)}%`;
+    const liveMode = audioWsConnected ? "WS" : "HTTP";
+    statusLabel.innerText =
+      `Status: Live (${liveMode}) • ${inRate} Hz • Buffer ${bufferedMs}ms • Delay ${latestFrontendLatency.audioApproxBrowserDelayMs}ms • Level ${(peak * 100).toFixed(0)}%`;
   }
 }
 
@@ -2010,6 +2151,7 @@ function setupVideoErrorHandling() {
     setTimeout(() => {
       const modal = document.getElementById("video-modal");
       if (modal && !modal.classList.contains("hidden")) {
+        lastVideoRequestStartedAt = performance.now();
         this.src = `${RPI_VIDEO_URL}?t=${Date.now()}`;
       }
     }, 3000);
@@ -2019,6 +2161,13 @@ function setupVideoErrorHandling() {
     this.style.display = "block";
     const err = document.getElementById("video-error-msg");
     if (err) err.remove();
+
+    lastVideoLoadedAt = performance.now();
+    if (lastVideoRequestStartedAt > 0) {
+      latestFrontendLatency.videoBrowserLoadMs = roundMetric(lastVideoLoadedAt - lastVideoRequestStartedAt, 2);
+    }
+
+    logLatencyMetricsToConsole(false);
   };
 }
 
@@ -2056,6 +2205,7 @@ async function openVideoModal() {
   const img = document.getElementById("cctv-feed");
   if (!img) return;
 
+  lastVideoRequestStartedAt = performance.now();
   img.src = `${RPI_VIDEO_URL}?t=${Date.now()}`;
   img.style.display = "block";
 
@@ -2336,6 +2486,10 @@ document.addEventListener("DOMContentLoaded", () => {
   updateAudioModalStatus();
   updateVideoModalStatus();
   updateData();
+  fetchStreamMetrics().catch(() => { });
+  setInterval(() => {
+    fetchStreamMetrics().catch(() => { });
+  }, 3000);
 
   const listeners = [
     "audio-zoom-x",
