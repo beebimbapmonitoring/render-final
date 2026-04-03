@@ -42,6 +42,7 @@ const AUDIO_STREAM_FORMAT = {
   sampleRate: 16000,
   channels: 1,
   bitDepth: 16,
+  format: "S16_LE",
 };
 
 const AUDIO_VIZ = {
@@ -225,6 +226,21 @@ function _pushToAudioRing(monoFloat32) {
       audioRingFilled = true;
     }
   }
+}
+
+function applyAudioStreamHeaders(headers) {
+  if (!headers) return;
+
+  const rate = Number(headers.get("X-Audio-Rate") || headers.get("x-audio-rate") || AUDIO_STREAM_FORMAT.sampleRate);
+  const channels = Number(headers.get("X-Audio-Channels") || headers.get("x-audio-channels") || AUDIO_STREAM_FORMAT.channels);
+  const format = String(headers.get("X-Audio-Format") || headers.get("x-audio-format") || AUDIO_STREAM_FORMAT.format || "S16_LE");
+
+  if (Number.isFinite(rate) && rate > 0) AUDIO_STREAM_FORMAT.sampleRate = rate;
+  if (Number.isFinite(channels) && channels > 0) AUDIO_STREAM_FORMAT.channels = channels;
+  AUDIO_STREAM_FORMAT.format = format;
+
+  _ensureAudioRing();
+  updateAudioParamLabels();
 }
 
 function loadSettings() {
@@ -1400,7 +1416,7 @@ function stopAlarmSound() {
   activeOscillators.forEach((osc) => {
     try {
       osc.stop();
-    } catch {}
+    } catch { }
   });
   activeOscillators = [];
 }
@@ -1499,6 +1515,7 @@ async function openAudioHttpResponse(signal) {
 
       if (resp.ok && resp.body) {
         activeAudioStreamUrl = url;
+        applyAudioStreamHeaders(resp.headers);
         return resp;
       }
 
@@ -1522,7 +1539,7 @@ async function startAudioHttpStream() {
   if (audioFetchController) {
     try {
       audioFetchController.abort();
-    } catch {}
+    } catch { }
   }
 
   audioFetchController = new AbortController();
@@ -1546,7 +1563,7 @@ async function startAudioHttpStream() {
     }
 
     pushAudioLog("Live audio (HTTP) connected", "Normal");
-    if (statusLabel) statusLabel.innerText = "Status: Live";
+    if (statusLabel) statusLabel.innerText = `Status: Live • ${AUDIO_STREAM_FORMAT.sampleRate} Hz`;
 
     audioReader = resp.body.getReader();
 
@@ -1576,10 +1593,10 @@ async function startAudioHttpStream() {
     if (audioReader) {
       try {
         await audioReader.cancel();
-      } catch {}
+      } catch { }
       try {
         audioReader.releaseLock();
-      } catch {}
+      } catch { }
       audioReader = null;
     }
 
@@ -1593,7 +1610,7 @@ async function startAudioHttpStream() {
 
 function playRawAudioBuffer(data) {
   const ctx = ensureAudioContext();
-  if (ctx.state === "suspended") ctx.resume().catch(() => {});
+  if (ctx.state === "suspended") ctx.resume().catch(() => { });
 
   if (!audioMasterGain) {
     audioMasterGain = ctx.createGain();
@@ -1616,7 +1633,7 @@ function playRawAudioBuffer(data) {
     if (abs > peak) peak = abs;
   }
 
-  const inRate = AUDIO_STREAM_FORMAT.sampleRate;
+  const inRate = AUDIO_STREAM_FORMAT.sampleRate || 16000;
   const outRate = ctx.sampleRate;
   const playData = resampleLinear(monoData, inRate, outRate);
 
@@ -1644,7 +1661,7 @@ function playRawAudioBuffer(data) {
   audioNextPlayTime += buffer.duration;
 
   const statusLabel = document.getElementById("audio-level-label");
-  if (statusLabel) statusLabel.innerText = `Status: Live • Level ${(peak * 100).toFixed(0)}%`;
+  if (statusLabel) statusLabel.innerText = `Status: Live • ${inRate} Hz • Level ${(peak * 100).toFixed(0)}%`;
 }
 
 function stopAudio() {
@@ -1660,17 +1677,17 @@ function stopAudio() {
   if (audioReader) {
     try {
       audioReader.cancel();
-    } catch {}
+    } catch { }
     try {
       audioReader.releaseLock();
-    } catch {}
+    } catch { }
     audioReader = null;
   }
 
   if (audioFetchController) {
     try {
       audioFetchController.abort();
-    } catch {}
+    } catch { }
     audioFetchController = null;
   }
   audioFetchRunning = false;
@@ -1683,7 +1700,7 @@ function stopAudio() {
   if (audioSocket) {
     try {
       audioSocket.close();
-    } catch {}
+    } catch { }
     audioSocket = null;
   }
 
