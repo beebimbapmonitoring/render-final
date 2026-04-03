@@ -52,6 +52,11 @@ const AUDIO_VIZ = {
   showGrid: true,
 };
 
+const AUDIO_WS_PREBUFFER_MS = 320;
+const AUDIO_WS_MAX_BUFFER_MS = 1800;
+const AUDIO_WS_QUEUE_POLL_MS = 20;
+const AUDIO_WS_STATUS_HYSTERESIS_MS = 800;
+
 function _safeJsonParse(value, fallback = null) {
   try {
     if (value == null || value === "") return fallback;
@@ -74,6 +79,14 @@ function buildAuthHeaders(extra = {}) {
   const token = getApiToken();
   if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
+}
+
+function getWebSocketUrlWithToken(baseUrl) {
+  const token = getApiToken();
+  if (!token) return baseUrl;
+  const url = new URL(baseUrl, window.location.href);
+  url.searchParams.set("token", token);
+  return url.toString();
 }
 
 async function apiFetch(url, options = {}) {
@@ -140,6 +153,13 @@ let audioStopRequested = false;
 let audioReconnectTimer = null;
 let audioReconnectAttempts = 0;
 let audioDesired = false;
+let audioWsConnected = false;
+
+let audioPacketQueue = [];
+let audioQueuedBytes = 0;
+let audioPlaybackLoopRunning = false;
+let audioLastBufferedAt = 0;
+let audioUnderrunSince = 0;
 
 let latestAudioClass = "normal";
 let latestAudioConf = 0;
@@ -228,6 +248,104 @@ function _pushToAudioRing(monoFloat32) {
   }
 }
 
+function getAudioBytesPerSecond() {
+  const sampleRate = AUDIO_STREAM_FORMAT.sampleRate || 16000;
+  const channels = AUDIO_STREAM_FORMAT.channels || 1;
+  const bytesPerSample = Math.max(1, (AUDIO_STREAM_FORMAT.bitDepth || 16) / 8);
+  return sampleRate * channels * bytesPerSample;
+}
+
+function getAudioPrebufferBytes() {
+  return Math.max(1, Math.floor(getAudioBytesPerSecond() * (AUDIO_WS_PREBUFFER_MS / 1000)));
+}
+
+function getAudioMaxBufferedBytes() {
+  return Math.max(getAudioPrebufferBytes(), Math.floor(getAudioBytesPerSecond() * (AUDIO_WS_MAX_BUFFER_MS / 1000)));
+}
+
+function enqueueAudioPacket(arrayBuffer) {
+  if (!arrayBuffer || !arrayBuffer.byteLength) return;
+
+  audioPacketQueue.push(arrayBuffer);
+  audioQueuedBytes += arrayBuffer.byteLength;
+  audioLastBufferedAt = Date.now();
+
+  const maxBytes = getAudioMaxBufferedBytes();
+  while (audioQueuedBytes > maxBytes && audioPacketQueue.length > 1) {
+    const dropped = audioPacketQueue.shift();
+    audioQueuedBytes -= dropped ? dropped.byteLength : 0;
+  }
+}
+
+function clearAudioPacketQueue() {
+  audioPacketQueue = [];
+  audioQueuedBytes = 0;
+  audioLastBufferedAt = 0;
+  audioUnderrunSince = 0;
+}
+
+function dequeueAudioPacketsUpTo(targetBytes) {
+  if (!audioPacketQueue.length) return null;
+
+  const chunks = [];
+  let total = 0;
+
+  while (audioPacketQueue.length && total < targetBytes) {
+    const packet = audioPacketQueue.shift();
+    if (!packet) continue;
+    chunks.push(packet);
+    total += packet.byteLength;
+    audioQueuedBytes -= packet.byteLength;
+  }
+
+  if (!chunks.length) return null;
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const packet of chunks) {
+    const view = new Uint8Array(packet);
+    merged.set(view, offset);
+    offset += view.byteLength;
+  }
+  return merged.buffer;
+}
+
+async function startAudioPlaybackLoop() {
+  if (audioPlaybackLoopRunning) return;
+  audioPlaybackLoopRunning = true;
+
+  try {
+    while (audioDesired && !audioStopRequested) {
+      const prebufferBytes = getAudioPrebufferBytes();
+
+      if (audioQueuedBytes < prebufferBytes) {
+        if (!audioUnderrunSince) audioUnderrunSince = Date.now();
+
+        if (audioUnderrunSince && (Date.now() - audioUnderrunSince) > AUDIO_WS_STATUS_HYSTERESIS_MS) {
+          const statusLabel = document.getElementById("audio-level-label");
+          if (statusLabel && audioWsConnected) {
+            statusLabel.innerText = `Status: Buffering... • ${AUDIO_STREAM_FORMAT.sampleRate} Hz`;
+          }
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, AUDIO_WS_QUEUE_POLL_MS));
+        continue;
+      }
+
+      audioUnderrunSince = 0;
+
+      const merged = dequeueAudioPacketsUpTo(prebufferBytes);
+      if (merged && merged.byteLength) {
+        playRawAudioBuffer(merged);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, AUDIO_WS_QUEUE_POLL_MS));
+      }
+    }
+  } finally {
+    audioPlaybackLoopRunning = false;
+  }
+}
+
 function applyAudioStreamHeaders(headers) {
   if (!headers) return;
 
@@ -237,6 +355,21 @@ function applyAudioStreamHeaders(headers) {
 
   if (Number.isFinite(rate) && rate > 0) AUDIO_STREAM_FORMAT.sampleRate = rate;
   if (Number.isFinite(channels) && channels > 0) AUDIO_STREAM_FORMAT.channels = channels;
+  AUDIO_STREAM_FORMAT.format = format;
+
+  _ensureAudioRing();
+  updateAudioParamLabels();
+}
+
+function applyAudioStreamConfig(config = {}) {
+  const rate = Number(config.sample_rate ?? config.sampleRate ?? AUDIO_STREAM_FORMAT.sampleRate);
+  const channels = Number(config.channels ?? AUDIO_STREAM_FORMAT.channels);
+  const bitDepth = Number(config.bit_depth ?? config.bitDepth ?? AUDIO_STREAM_FORMAT.bitDepth);
+  const format = String(config.format ?? AUDIO_STREAM_FORMAT.format ?? "S16_LE");
+
+  if (Number.isFinite(rate) && rate > 0) AUDIO_STREAM_FORMAT.sampleRate = rate;
+  if (Number.isFinite(channels) && channels > 0) AUDIO_STREAM_FORMAT.channels = channels;
+  if (Number.isFinite(bitDepth) && bitDepth > 0) AUDIO_STREAM_FORMAT.bitDepth = bitDepth;
   AUDIO_STREAM_FORMAT.format = format;
 
   _ensureAudioRing();
@@ -1361,7 +1494,7 @@ function ensureAudioContext() {
     audioMasterGain = audioContext.createGain();
     audioMasterGain.gain.value = 2.5;
     audioMasterGain.connect(audioContext.destination);
-    audioNextPlayTime = audioContext.currentTime + 0.05;
+    audioNextPlayTime = audioContext.currentTime + 0.12;
   }
   return audioContext;
 }
@@ -1452,7 +1585,7 @@ async function toggleAudio() {
       }
 
       await ensureAudioContextRunning();
-      audioNextPlayTime = audioContext.currentTime + 0.05;
+      audioNextPlayTime = audioContext.currentTime + 0.12;
       startAudioSocket();
       if (statusLabel) statusLabel.innerText = "Status: Connecting...";
     } else {
@@ -1490,7 +1623,126 @@ function _scheduleAudioReconnect(reason = "") {
 }
 
 function startAudioSocket() {
-  startAudioHttpStream();
+  if (audioSocket && (audioSocket.readyState === WebSocket.OPEN || audioSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  const statusLabel = document.getElementById("audio-level-label");
+
+  if (audioReconnectTimer) {
+    clearTimeout(audioReconnectTimer);
+    audioReconnectTimer = null;
+  }
+
+  if (audioPingInterval) {
+    clearInterval(audioPingInterval);
+    audioPingInterval = null;
+  }
+
+  clearAudioPacketQueue();
+
+  try {
+    audioSocket = new WebSocket(getWebSocketUrlWithToken(RPI_AUDIO_WS_URL));
+    audioSocket.binaryType = "arraybuffer";
+  } catch (err) {
+    console.warn("Audio WS init error:", err);
+    audioDrawMode = "error";
+    updateAudioCardStatus("Error", "#ff4757");
+    if (statusLabel) statusLabel.innerText = "Status: WS init failed";
+    _scheduleAudioReconnect("ws init failed");
+    return;
+  }
+
+  isListening = true;
+  audioWsConnected = false;
+  audioDrawMode = "live";
+  updateAudioButtonState(true);
+  updateAudioCardStatus("Live", "#2ecc71");
+
+  if (statusLabel) statusLabel.innerText = "Status: Connecting...";
+  pushAudioLog("Live audio (WS) connecting", "Normal");
+
+  audioSocket.onopen = () => {
+    audioReconnectAttempts = 0;
+    _ensureAudioRing();
+    clearAudioPacketQueue();
+    startAudioPlaybackLoop();
+
+    if (audioReconnectTimer) {
+      clearTimeout(audioReconnectTimer);
+      audioReconnectTimer = null;
+    }
+
+    audioWsConnected = true;
+    if (statusLabel) statusLabel.innerText = "Status: Live (WS)";
+    pushAudioLog("Live audio (WS) connected", "Normal");
+
+    audioPingInterval = setInterval(() => {
+      if (!audioSocket || audioSocket.readyState !== WebSocket.OPEN) return;
+      try {
+        audioSocket.send("ping");
+      } catch { }
+    }, 20000);
+  };
+
+  audioSocket.onmessage = (event) => {
+    if (typeof event.data === "string") {
+      if (event.data === "pong") return;
+
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload && payload.type === "audio_format") {
+          applyAudioStreamConfig(payload);
+          clearAudioPacketQueue();
+          startAudioPlaybackLoop();
+          const current = document.getElementById("audio-level-label");
+          if (current && isListening) {
+            current.innerText = `Status: Live (WS) • ${AUDIO_STREAM_FORMAT.sampleRate} Hz`;
+          }
+        }
+      } catch { }
+      return;
+    }
+
+    if (event.data instanceof ArrayBuffer) {
+      enqueueAudioPacket(event.data);
+      return;
+    }
+
+    if (event.data instanceof Blob) {
+      event.data.arrayBuffer()
+        .then((buf) => {
+          if (audioDesired && !audioStopRequested) enqueueAudioPacket(buf);
+        })
+        .catch(() => { });
+    }
+  };
+
+  audioSocket.onerror = (err) => {
+    console.warn("Audio WS error:", err);
+    audioDrawMode = "error";
+    updateAudioCardStatus("Error", "#ff4757");
+    const label = document.getElementById("audio-level-label");
+    if (label) label.innerText = "Status: WS error";
+  };
+
+  audioSocket.onclose = () => {
+    if (audioPingInterval) {
+      clearInterval(audioPingInterval);
+      audioPingInterval = null;
+    }
+
+    audioSocket = null;
+    audioWsConnected = false;
+
+    if (audioDesired && !audioStopRequested) {
+      pushAudioLog("Live audio (WS) disconnected", "Warning");
+      _scheduleAudioReconnect("ws closed");
+    } else {
+      isListening = false;
+      audioDrawMode = "waiting";
+    }
+  };
 }
 
 function getAudioStreamCandidates() {
@@ -1647,8 +1899,8 @@ function playRawAudioBuffer(data) {
   source.buffer = buffer;
   source.connect(audioMasterGain);
 
-  const safeLead = 0.05;
-  const maxLagSeconds = 0.18;
+  const safeLead = 0.12;
+  const maxLagSeconds = 0.75;
 
   if (audioNextPlayTime < ctx.currentTime + safeLead) {
     audioNextPlayTime = ctx.currentTime + safeLead;
@@ -1660,8 +1912,11 @@ function playRawAudioBuffer(data) {
   source.start(audioNextPlayTime);
   audioNextPlayTime += buffer.duration;
 
+  const bufferedMs = Math.round((audioQueuedBytes / getAudioBytesPerSecond()) * 1000);
   const statusLabel = document.getElementById("audio-level-label");
-  if (statusLabel) statusLabel.innerText = `Status: Live • ${inRate} Hz • Level ${(peak * 100).toFixed(0)}%`;
+  if (statusLabel) {
+    statusLabel.innerText = `Status: Live (WS) • ${inRate} Hz • Buffer ${bufferedMs}ms • Level ${(peak * 100).toFixed(0)}%`;
+  }
 }
 
 function stopAudio() {
@@ -1699,10 +1954,19 @@ function stopAudio() {
 
   if (audioSocket) {
     try {
+      if (audioSocket.readyState === WebSocket.OPEN) {
+        audioSocket.send("close");
+      }
+    } catch { }
+    try {
       audioSocket.close();
     } catch { }
     audioSocket = null;
   }
+
+  audioWsConnected = false;
+  audioPlaybackLoopRunning = false;
+  clearAudioPacketQueue();
 
   const audioTag = document.getElementById("live-audio-player");
   if (audioTag) {
@@ -1712,7 +1976,7 @@ function stopAudio() {
   }
 
   const ctx = audioContext;
-  audioNextPlayTime = ctx ? ctx.currentTime + 0.05 : 0;
+  audioNextPlayTime = ctx ? ctx.currentTime + 0.12 : 0;
 
   _clearAudioRing();
   isListening = false;
@@ -1983,7 +2247,7 @@ function animateSpectrogram(canvas) {
     const msgY = y0 + plotH / 2;
 
     if (audioDrawMode === "error") ctx.fillText("Audio stream error", msgX, msgY);
-    else if (isListening) ctx.fillText("Connected... waiting for audio data", msgX, msgY);
+    else if (isListening) ctx.fillText("Connected... buffering audio...", msgX, msgY);
     else ctx.fillText("Press LISTEN LIVE to start", msgX, msgY);
   }
 
@@ -2100,7 +2364,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   window.addEventListener("online", () => {
-    if (audioDesired && !audioFetchRunning) startAudioSocket();
+    if (audioDesired && !audioSocket) startAudioSocket();
   });
 
   window.addEventListener("beforeunload", () => {
