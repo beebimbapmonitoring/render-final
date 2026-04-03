@@ -103,6 +103,25 @@ def _require_rpi_event_token(x_rpi_token: str | None) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _passthrough_response_headers(source_headers: httpx.Headers) -> dict[str, str]:
+    allowed = {
+        "content-type",
+        "cache-control",
+        "pragma",
+        "expires",
+        "connection",
+        "x-accel-buffering",
+        "x-audio-format",
+        "x-audio-rate",
+        "x-audio-channels",
+    }
+    headers: dict[str, str] = {}
+    for key, value in source_headers.items():
+        if key.lower() in allowed:
+            headers[key] = value
+    return headers
+
+
 @app.get("/__routes")
 async def debug_routes() -> dict[str, list[dict[str, Any]]]:
     routes = []
@@ -167,6 +186,7 @@ async def _forward_get(path: str, timeout_s: float = 12.0) -> Response:
         content=response.content,
         status_code=response.status_code,
         media_type=response.headers.get("content-type", "application/octet-stream"),
+        headers=_passthrough_response_headers(response.headers),
     )
 
 
@@ -179,6 +199,7 @@ async def _forward_post(path: str, payload: Any = None, timeout_s: float = 12.0)
         content=response.content,
         status_code=response.status_code,
         media_type=response.headers.get("content-type", "application/json"),
+        headers=_passthrough_response_headers(response.headers),
     )
 
 
@@ -190,6 +211,32 @@ async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
             async for chunk in response.aiter_bytes():
                 if chunk:
                     yield chunk
+
+
+async def _stream_upstream_with_headers(url: str) -> tuple[AsyncIterator[bytes], dict[str, str], str]:
+    timeout = httpx.Timeout(connect=12, read=None, write=12, pool=12)
+    client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    response = await client.stream("GET", url, headers=_auth_headers()).__aenter__()
+    try:
+        response.raise_for_status()
+    except Exception:
+        await response.aclose()
+        await client.aclose()
+        raise
+
+    headers = _passthrough_response_headers(response.headers)
+    media_type = response.headers.get("content-type", "application/octet-stream")
+
+    async def gen() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in response.aiter_bytes():
+                if chunk:
+                    yield chunk
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return gen(), headers, media_type
 
 
 @app.get("/api/latest")
@@ -219,17 +266,13 @@ async def audio_http() -> Response:
 @app.get("/audio/stream")
 async def audio_stream() -> StreamingResponse:
     url = f"{_pi_http_base()}/audio/stream"
-    return StreamingResponse(
-        _stream_upstream(url),
-        media_type="application/octet-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    body, headers, media_type = await _stream_upstream_with_headers(url)
+    headers.setdefault("Cache-Control", "no-cache, no-store, must-revalidate")
+    headers.setdefault("Pragma", "no-cache")
+    headers.setdefault("Expires", "0")
+    headers.setdefault("Connection", "keep-alive")
+    headers.setdefault("X-Accel-Buffering", "no")
+    return StreamingResponse(body, media_type=media_type, headers=headers)
 
 
 @app.get("/audio/stream/")
@@ -240,17 +283,13 @@ async def audio_stream_slash() -> StreamingResponse:
 @app.get("/api/audio/stream")
 async def api_audio_stream() -> StreamingResponse:
     url = f"{_pi_http_base()}/api/audio/stream"
-    return StreamingResponse(
-        _stream_upstream(url),
-        media_type="application/octet-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    body, headers, media_type = await _stream_upstream_with_headers(url)
+    headers.setdefault("Cache-Control", "no-cache, no-store, must-revalidate")
+    headers.setdefault("Pragma", "no-cache")
+    headers.setdefault("Expires", "0")
+    headers.setdefault("Connection", "keep-alive")
+    headers.setdefault("X-Accel-Buffering", "no")
+    return StreamingResponse(body, media_type=media_type, headers=headers)
 
 
 @app.get("/api/audio/stream/")
@@ -363,6 +402,11 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
 @app.websocket("/ws/sensors")
 async def ws_sensors(ws: WebSocket) -> None:
     await _ws_passthrough(ws, "/ws/sensors")
+
+
+@app.websocket("/ws/audio")
+async def ws_audio(ws: WebSocket) -> None:
+    await _ws_passthrough(ws, "/ws/audio")
 
 
 @app.post("/api/events")
