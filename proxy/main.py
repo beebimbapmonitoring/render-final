@@ -1,3 +1,4 @@
+# main.py
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +10,7 @@ from urllib.parse import urlparse
 
 import httpx
 import websockets
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
@@ -48,17 +49,19 @@ async def startup_event() -> None:
 @app.middleware("http")
 async def always_cors(request: Request, call_next):
     try:
-        resp = await call_next(request)
+        response = await call_next(request)
     except Exception as exc:
         logger.exception("Unhandled HTTP proxy error")
-        resp = JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+        response = JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
     origin = request.headers.get("origin", "*")
-    resp.headers["Access-Control-Allow-Origin"] = origin
-    resp.headers["Vary"] = "Origin"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-token, x-rpi-token, Authorization"
-    return resp
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, x-admin-token, x-rpi-token, Authorization"
+    )
+    return response
 
 
 @app.options("/{path:path}")
@@ -124,7 +127,7 @@ def _passthrough_response_headers(source_headers: httpx.Headers) -> dict[str, st
 
 @app.get("/__routes")
 async def debug_routes() -> dict[str, list[dict[str, Any]]]:
-    routes = []
+    routes: list[dict[str, Any]] = []
     for route in app.router.routes:
         path = getattr(route, "path", str(route))
         methods = sorted(getattr(route, "methods", []) or [])
@@ -133,7 +136,7 @@ async def debug_routes() -> dict[str, list[dict[str, Any]]]:
 
 
 @app.get("/health")
-async def health(db: Session = Depends(get_db)) -> dict:
+async def health(db: Session = Depends(get_db)) -> dict[str, Any]:
     db_ok = False
     try:
         db.execute(EventLog.__table__.select().limit(1))
@@ -152,7 +155,7 @@ async def health(db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/admin/set-pi")
-async def admin_set_pi(payload: dict, request: Request) -> Response:
+async def admin_set_pi(payload: dict[str, Any], request: Request) -> Response:
     global PI_HTTP_BASE_RUNTIME
 
     if not ADMIN_TOKEN:
@@ -190,10 +193,19 @@ async def _forward_get(path: str, timeout_s: float = 12.0) -> Response:
     )
 
 
-async def _forward_post(path: str, payload: Any = None, timeout_s: float = 12.0) -> Response:
+async def _forward_post(
+    path: str,
+    payload: Any = None,
+    timeout_s: float = 12.0,
+    extra_headers: Optional[dict[str, str]] = None,
+) -> Response:
     url = f"{_pi_http_base()}/{path.lstrip('/')}"
+    headers = _auth_headers()
+    if extra_headers:
+        headers.update(extra_headers)
+
     async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
-        response = await client.post(url, json=payload, headers=_auth_headers())
+        response = await client.post(url, json=payload, headers=headers)
 
     return Response(
         content=response.content,
@@ -213,7 +225,9 @@ async def _stream_upstream(url: str) -> AsyncIterator[bytes]:
                     yield chunk
 
 
-async def _stream_upstream_with_headers(url: str) -> tuple[AsyncIterator[bytes], dict[str, str], str]:
+async def _stream_upstream_with_headers(
+    url: str,
+) -> tuple[AsyncIterator[bytes], dict[str, str], str]:
     timeout = httpx.Timeout(connect=12, read=None, write=12, pool=12)
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
     response = await client.stream("GET", url, headers=_auth_headers()).__aenter__()
@@ -244,9 +258,14 @@ async def api_latest() -> Response:
     return await _forward_get("/api/latest")
 
 
-@app.get("/api/sensors")
-async def api_sensors() -> Response:
-    return await _forward_get("/api/sensors")
+@app.get("/api/debug/audio")
+async def api_debug_audio() -> Response:
+    return await _forward_get("/api/debug/audio")
+
+
+@app.get("/api/debug/camera")
+async def api_debug_camera() -> Response:
+    return await _forward_get("/api/debug/camera")
 
 
 @app.get("/video.mjpg")
@@ -256,11 +275,6 @@ async def video_mjpg() -> StreamingResponse:
         _stream_upstream(url),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
-
-
-@app.get("/audio")
-async def audio_http() -> Response:
-    return await _forward_get("/audio", timeout_s=60.0)
 
 
 @app.get("/audio/stream")
@@ -297,6 +311,17 @@ async def api_audio_stream_slash() -> StreamingResponse:
     return await api_audio_stream()
 
 
+@app.post("/receive-data")
+async def receive_data_proxy(
+    payload: dict[str, Any],
+    authorization: str | None = Header(default=None),
+) -> Response:
+    extra_headers: dict[str, str] = {}
+    if authorization:
+        extra_headers["Authorization"] = authorization
+    return await _forward_post("/receive-data", payload=payload, extra_headers=extra_headers)
+
+
 @app.post("/api/video/open")
 async def api_video_open() -> Response:
     return await _forward_post("/api/video/open")
@@ -317,6 +342,11 @@ async def api_alert_reset() -> Response:
     return await _forward_post("/api/alert/reset")
 
 
+@app.post("/api/events/test")
+async def api_events_test() -> Response:
+    return await _forward_post("/api/events/test")
+
+
 def _build_upstream_ws_url(ws: WebSocket, upstream_path: str) -> str:
     base = _pi_ws_base()
     path = upstream_path.lstrip("/")
@@ -334,8 +364,8 @@ async def _safe_close_ws(ws: WebSocket, code: int = 1011, reason: str = "") -> N
         pass
 
 
-def _websocket_connect_kwargs(headers: dict[str, str]) -> dict:
-    kwargs = {
+def _websocket_connect_kwargs(headers: dict[str, str]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
         "ping_interval": 20,
         "ping_timeout": 20,
         "open_timeout": 20,
@@ -352,19 +382,22 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
     headers = _auth_headers()
 
     try:
-        async with websockets.connect(upstream_url, **_websocket_connect_kwargs(headers)) as upstream:
+        async with websockets.connect(
+            upstream_url,
+            **_websocket_connect_kwargs(headers),
+        ) as upstream:
             await ws.accept()
 
             async def client_to_upstream() -> None:
                 try:
                     while True:
-                        msg = await ws.receive()
-                        if msg["type"] == "websocket.disconnect":
+                        message = await ws.receive()
+                        if message["type"] == "websocket.disconnect":
                             break
-                        if msg.get("text") is not None:
-                            await upstream.send(msg["text"])
-                        elif msg.get("bytes") is not None:
-                            await upstream.send(msg["bytes"])
+                        if message.get("text") is not None:
+                            await upstream.send(message["text"])
+                        elif message.get("bytes") is not None:
+                            await upstream.send(message["bytes"])
                 except WebSocketDisconnect:
                     pass
                 finally:
@@ -383,10 +416,13 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
                 finally:
                     await _safe_close_ws(ws, code=1011, reason="Upstream websocket closed")
 
-            t1 = asyncio.create_task(client_to_upstream())
-            t2 = asyncio.create_task(upstream_to_client())
+            client_task = asyncio.create_task(client_to_upstream())
+            upstream_task = asyncio.create_task(upstream_to_client())
 
-            done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                {client_task, upstream_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
             for task in pending:
                 task.cancel()
@@ -399,18 +435,17 @@ async def _ws_passthrough(ws: WebSocket, upstream_path: str) -> None:
         await _safe_close_ws(ws, code=1011, reason="Upstream connection failed")
 
 
-@app.websocket("/ws/sensors")
-async def ws_sensors(ws: WebSocket) -> None:
-    await _ws_passthrough(ws, "/ws/sensors")
-
-
 @app.websocket("/ws/audio")
 async def ws_audio(ws: WebSocket) -> None:
     await _ws_passthrough(ws, "/ws/audio")
 
 
 @app.post("/api/events")
-async def api_events(payload: EventIn, request: Request, db: Session = Depends(get_db)):
+async def api_events(
+    payload: EventIn,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     _require_rpi_event_token(request.headers.get("x-rpi-token"))
 
     allowed_events = {"intruded", "stress_buzz", "swarming"}
@@ -429,7 +464,10 @@ async def api_events(payload: EventIn, request: Request, db: Session = Depends(g
         return {"ok": True, "id": row.id}
     except Exception as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to insert event: {type(exc).__name__}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to insert event: {type(exc).__name__}",
+        ) from exc
 
 
 @app.get("/api/events")
@@ -438,9 +476,8 @@ async def get_events(
     kind: Optional[str] = Query(default=None),
     event: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
-):
+) -> dict[str, Any]:
     rows = crud_list_events(db, limit=limit, kind=kind, event=event)
-
     return {
         "ok": True,
         "items": [
